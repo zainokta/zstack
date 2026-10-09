@@ -17,7 +17,7 @@
                                └─ debugger / operator ◄────┘  (reserve slots)
 ```
 
-- **Host.** The manager runs as a Claude Code session agent (`zstack up` → `claude --plugin-dir ~/Project/zstack --agent zstack:manager`). Jev chose this hybrid (0.97) over plugin-only or CLI-only.
+- **Host.** By default the manager runs as a Claude Code session agent (`zstack` → `claude --plugin-dir ~/Project/zstack --agent zstack:manager`). Jev chose this hybrid (0.97) over plugin-only or CLI-only. `zstack --host codex|omp|pi|opencode` runs the same manager prompt (agent body + playbook + bus + Jev + git skills + a host note) in another harness, with that host's role profile.
 - **Workers run anywhere.** They are either in-session Claude subagents (Agent tool, `zstack:<role>`), or headless processes on codex/omp/pi/opencode/`claude -p` started by `zstack spawn`. Both kinds share the same bus. That is how a Codex reviewer checks a Claude worker.
 - **State lives outside the repo** in `~/.local/state/zstack/runs/<run>/`: `meta.json`, `agents.json`, `tasks.json`, `bus.jsonl`, `decisions.jsonl`, `briefs/`, `logs/`, `artifacts/` (plan, last answers, report). Nothing zstack writes can be committed by accident. A crashed session resumes from the ledger.
 
