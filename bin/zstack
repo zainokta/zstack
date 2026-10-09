@@ -1,0 +1,994 @@
+#!/usr/bin/env python3
+"""zstack: run ledger, message bus, agent cap and Jev sizing for a manager-led agent team.
+
+State lives outside the repo, in $ZSTACK_HOME (default ~/.local/state/zstack), so nothing
+zstack writes can be committed by accident. Every run is a directory under runs/.
+"""
+import argparse
+import datetime as dt
+import fcntl
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+HOME = Path(os.environ.get("ZSTACK_HOME", Path.home() / ".local/state/zstack"))
+HARD_MAX_AGENTS = 100
+ROLES = ["scout", "planner", "worker", "reviewer", "tester", "debugger", "operator", "verifier", "scribe"]
+READONLY_ROLES = {"scout", "reviewer", "verifier"}
+ACTIVE = {"running", "waiting"}
+TASK_STATES = ["todo", "doing", "review", "testing", "done", "failed", "blocked"]
+
+
+class ZError(Exception):
+    pass
+
+
+# ---------- config ----------
+
+def load_config():
+    cfg = tomllib.loads((ROOT / "config/zstack.toml").read_text())
+    override = HOME / "zstack.toml"
+    if override.exists():
+        for k, v in tomllib.loads(override.read_text()).items():
+            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                for k2, v2 in v.items():
+                    if isinstance(v2, dict) and isinstance(cfg[k].get(k2), dict):
+                        cfg[k][k2].update(v2)
+                    else:
+                        cfg[k][k2] = v2
+            else:
+                cfg[k] = v
+    lim = cfg["limits"]
+    lim["max_agents"] = min(int(lim.get("max_agents", HARD_MAX_AGENTS)), HARD_MAX_AGENTS)
+    return cfg
+
+
+# ---------- run state ----------
+
+def now():
+    return dt.datetime.now().isoformat(timespec="seconds")
+
+
+def slug(text, n=32):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:n] or "run"
+
+
+class Run:
+    def __init__(self, run_id):
+        self.id = run_id
+        self.dir = HOME / "runs" / run_id
+        if not (self.dir / "meta.json").exists():
+            raise ZError(f"run not found: {run_id}")
+
+    @contextmanager
+    def locked(self):
+        with open(self.dir / ".lock", "w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+    def read(self, name, default):
+        p = self.dir / name
+        return json.loads(p.read_text()) if p.exists() else default
+
+    def write(self, name, data):
+        p = self.dir / name
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(p)
+
+    def append(self, name, rec):
+        with open(self.dir / name, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+    def lines(self, name):
+        p = self.dir / name
+        if not p.exists():
+            return []
+        return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+
+    @property
+    def meta(self):
+        return self.read("meta.json", {})
+
+
+def resolve_run(args):
+    rid = getattr(args, "run", None) or os.environ.get("ZSTACK_RUN")
+    if not rid and (HOME / "current").exists():
+        rid = (HOME / "current").read_text().strip()
+    if not rid:
+        raise ZError("no run: pass --run, set ZSTACK_RUN, or `zstack init` first")
+    return Run(rid)
+
+
+def me(args):
+    return getattr(args, "as_", None) or os.environ.get("ZSTACK_AGENT") or "manager"
+
+
+def out(args, data, text=None):
+    if getattr(args, "json", False) or text is None:
+        print(json.dumps(data, indent=2))
+    else:
+        print(text)
+
+
+# ---------- init / status ----------
+
+def cmd_init(args):
+    cfg = load_config()
+    repo = str(Path(args.repo or os.getcwd()).resolve())
+    run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + slug(args.goal)
+    d = HOME / "runs" / run_id
+    for sub in ("cursors", "logs", "briefs", "artifacts"):
+        (d / sub).mkdir(parents=True, exist_ok=True)
+    max_agents = min(args.max_agents or cfg["limits"]["max_agents"], HARD_MAX_AGENTS)
+    meta = {
+        "id": run_id, "goal": args.goal, "repo": repo, "created": now(), "state": "open",
+        "max_agents": max_agents,
+        "max_parallel": args.max_parallel or cfg["limits"]["max_parallel"],
+        "policy": {"git": args.git, "worktree": args.worktree, "deploy": args.deploy},
+    }
+    (d / "meta.json").write_text(json.dumps(meta, indent=2))
+    (HOME / "current").write_text(run_id)
+    out(args, meta, run_id)
+
+
+def agent_alive(a):
+    pid = a.get("pid")
+    if not pid:
+        return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def cmd_status(args):
+    run = resolve_run(args)
+    agents = run.read("agents.json", {})
+    tasks = run.read("tasks.json", {})
+    msgs = run.lines("bus.jsonl")
+    unread = {aid: len(inbox(run, aid, msgs)) for aid in list(agents) + ["manager"]}
+    data = {"run": run.meta, "agents": agents, "tasks": tasks, "unread": unread}
+    if args.json:
+        return out(args, data)
+    m = run.meta
+    by_state = {}
+    for a in agents.values():
+        by_state[a["state"]] = by_state.get(a["state"], 0) + 1
+    print(f"run {m['id']}  [{m['state']}]  repo={m['repo']}")
+    print(f"goal: {m['goal']}")
+    print(f"agents: {len(agents)}/{m['max_agents']} spawned, "
+          f"{sum(1 for a in agents.values() if a['state'] in ACTIVE)}/{m['max_parallel']} active  {by_state}")
+    for a in agents.values():
+        alive = agent_alive(a)
+        flag = "" if alive is None else (" pid:alive" if alive else " pid:exited")
+        print(f"  {a['id']:<14} {a['state']:<8} {a['harness']}/{a['model']:<12} task={a.get('task') or '-'}"
+              f" unread={unread.get(a['id'], 0)}{flag}")
+    if tasks:
+        print("tasks:")
+        for t in tasks.values():
+            print(f"  {t['id']:<5} {t['state']:<8} owner={t.get('owner') or '-':<12} rounds={t['rounds']} {t['title']}")
+    print(f"manager unread: {unread['manager']}")
+
+
+# ---------- agents ----------
+
+def role_cfg(cfg, role):
+    if role not in cfg["roles"]:
+        raise ZError(f"unknown role {role!r}; known: {', '.join(cfg['roles'])}")
+    return cfg["roles"][role]
+
+
+def cmd_agent_add(args):
+    cfg = load_config()
+    run = resolve_run(args)
+    rc = role_cfg(cfg, args.role)
+    with run.locked():
+        agents = run.read("agents.json", {})
+        meta = run.meta
+        if len(agents) >= meta["max_agents"]:
+            raise ZError(f"agent cap reached: {len(agents)}/{meta['max_agents']} spawned in this run")
+        state = "planned" if args.planned else "running"
+        active = sum(1 for a in agents.values() if a["state"] in ACTIVE)
+        if state == "running" and active >= meta["max_parallel"]:
+            raise ZError(f"parallel cap reached: {active}/{meta['max_parallel']} active; "
+                         "wait for one to finish or add with --planned")
+        harness = args.harness or rc["harness"]
+        model = args.model or (rc["model"] if harness == rc["harness"]
+                               else cfg["harness"].get(harness, {}).get("default_model", rc["model"]))
+        n = 1 + sum(1 for a in agents.values() if a["role"] == args.role)
+        aid = f"{args.role}-{n}"
+        agents[aid] = {
+            "id": aid, "role": args.role, "harness": harness,
+            "model": model, "agent": rc.get("agent"),
+            "persona": args.persona, "task": args.task, "state": state,
+            "created": now(), "updated": now(), "note": None, "pid": None, "session": None,
+        }
+        run.write("agents.json", agents)
+    out(args, agents[aid], aid)
+
+
+def cmd_agent_set(args):
+    run = resolve_run(args)
+    with run.locked():
+        agents = run.read("agents.json", {})
+        a = agents.get(args.id)
+        if not a:
+            raise ZError(f"unknown agent {args.id}")
+        if args.state:
+            if args.state in ACTIVE and a["state"] not in ACTIVE:
+                active = sum(1 for x in agents.values() if x["state"] in ACTIVE)
+                if active >= run.meta["max_parallel"]:
+                    raise ZError(f"parallel cap reached: {active}/{run.meta['max_parallel']} active")
+            a["state"] = args.state
+        for field in ("note", "session", "task"):
+            if getattr(args, field, None):
+                a[field] = getattr(args, field)
+        a["updated"] = now()
+        run.write("agents.json", agents)
+    out(args, a, f"{a['id']} -> {a['state']}")
+
+
+def cmd_agent_list(args):
+    run = resolve_run(args)
+    agents = run.read("agents.json", {})
+    if args.json:
+        return out(args, agents)
+    for a in agents.values():
+        print(f"{a['id']:<14} {a['state']:<8} {a['harness']}/{a['model']} persona={a.get('persona') or '-'} task={a.get('task') or '-'}")
+
+
+# ---------- bus ----------
+
+def recipients_match(msg, aid, role):
+    to = msg["to"]
+    return to == aid or to == "all" or (role and to == f"role:{role}")
+
+
+def inbox(run, aid, msgs=None, since=None):
+    msgs = run.lines("bus.jsonl") if msgs is None else msgs
+    agents = run.read("agents.json", {})
+    role = agents.get(aid, {}).get("role") if aid != "manager" else "manager"
+    if since is None:
+        cur = run.dir / "cursors" / aid
+        since = int(cur.read_text()) if cur.exists() else 0
+    return [m for m in msgs if m["seq"] > since and m["from"] != aid and recipients_match(m, aid, role)]
+
+
+def cmd_msg_send(args):
+    run = resolve_run(args)
+    body = Path(args.file).read_text() if args.file else args.body
+    if body is None:
+        body = sys.stdin.read()
+    with run.locked():
+        agents = run.read("agents.json", {})
+        to = args.to
+        if not (to in agents or to in ("manager", "all") or to.startswith("role:")):
+            raise ZError(f"unknown recipient {to!r}: use an agent id, manager, all, or role:<role>")
+        seq = len(run.lines("bus.jsonl")) + 1
+        msg = {"seq": seq, "ts": now(), "from": me(args), "to": to, "kind": args.kind,
+               "ref": args.ref, "body": body}
+        run.append("bus.jsonl", msg)
+    out(args, msg, f"#{seq} {msg['from']} -> {to} [{args.kind}]")
+
+
+def render_msgs(msgs):
+    return "\n\n".join(
+        f"#{m['seq']} {m['ts']} {m['from']} -> {m['to']} [{m['kind']}]"
+        + (f" ref={m['ref']}" if m.get("ref") else "") + f"\n{m['body']}"
+        for m in msgs) or "(no new messages)"
+
+
+def advance(run, aid, msgs):
+    if msgs:
+        (run.dir / "cursors" / aid).write_text(str(max(m["seq"] for m in msgs)))
+
+
+def cmd_msg_inbox(args):
+    run = resolve_run(args)
+    aid = me(args)
+    msgs = inbox(run, aid, since=0 if args.all else None)
+    if args.kind:
+        msgs = [m for m in msgs if m["kind"] == args.kind]
+    if not args.peek:
+        advance(run, aid, msgs)
+    out(args, msgs, render_msgs(msgs))
+
+
+def cmd_msg_wait(args):
+    run = resolve_run(args)
+    aid = me(args)
+    deadline = time.time() + args.timeout
+    while True:
+        msgs = inbox(run, aid)
+        if args.kind:
+            msgs = [m for m in msgs if m["kind"] in args.kind.split(",")]
+        if msgs:
+            advance(run, aid, msgs)
+            return out(args, msgs, render_msgs(msgs))
+        if time.time() >= deadline:
+            print("(timeout: no new messages)")
+            sys.exit(2)
+        time.sleep(args.interval)
+
+
+def cmd_msg_log(args):
+    run = resolve_run(args)
+    msgs = run.lines("bus.jsonl")
+    if args.kind:
+        msgs = [m for m in msgs if m["kind"] == args.kind]
+    out(args, msgs[-args.tail:], render_msgs(msgs[-args.tail:]))
+
+
+# ---------- tasks ----------
+
+def paths_overlap(a, b):
+    for p in a:
+        for q in b:
+            p2, q2 = p.rstrip("/"), q.rstrip("/")
+            if p2 == q2 or p2.startswith(q2 + "/") or q2.startswith(p2 + "/"):
+                return True
+    return False
+
+
+def cmd_task_add(args):
+    run = resolve_run(args)
+    with run.locked():
+        tasks = run.read("tasks.json", {})
+        tid = f"t{len(tasks) + 1}"
+        deps = [d for d in (args.deps or "").split(",") if d]
+        missing = [d for d in deps if d not in tasks]
+        if missing:
+            raise ZError(f"unknown dependencies: {missing}")
+        tasks[tid] = {
+            "id": tid, "title": args.title, "accept": args.accept, "deps": deps,
+            "paths": [p for p in (args.paths or "").split(",") if p], "repo": args.repo,
+            "owner": None, "reviewers": [], "state": "todo", "rounds": 0,
+            "evidence": [], "created": now(), "updated": now(),
+        }
+        run.write("tasks.json", tasks)
+    out(args, tasks[tid], tid)
+
+
+def cmd_task_claim(args):
+    run = resolve_run(args)
+    aid = args.owner or me(args)
+    with run.locked():
+        tasks = run.read("tasks.json", {})
+        t = tasks.get(args.id)
+        if not t:
+            raise ZError(f"unknown task {args.id}")
+        if t["state"] not in ("todo", "failed", "blocked"):
+            raise ZError(f"{t['id']} is {t['state']}, not claimable")
+        pending = [d for d in t["deps"] if tasks[d]["state"] != "done"]
+        if pending:
+            raise ZError(f"{t['id']} waits on unfinished dependencies: {pending}")
+        for o in tasks.values():
+            if o["id"] != t["id"] and o["state"] in ("doing", "review", "testing") \
+                    and o.get("repo") == t.get("repo") and paths_overlap(t["paths"], o["paths"]):
+                raise ZError(f"{t['id']} paths overlap {o['id']} (owner {o['owner']}); serialize or use a worktree")
+        t.update(owner=aid, state="doing", updated=now())
+        run.write("tasks.json", tasks)
+    out(args, t, f"{t['id']} claimed by {aid}")
+
+
+def cmd_task_set(args):
+    run = resolve_run(args)
+    with run.locked():
+        tasks = run.read("tasks.json", {})
+        t = tasks.get(args.id)
+        if not t:
+            raise ZError(f"unknown task {args.id}")
+        if args.evidence:
+            t["evidence"].append({"by": me(args), "ts": now(), "text": args.evidence})
+        if args.state == "done" and not t["evidence"]:
+            raise ZError("a task cannot be done without evidence: pass --evidence with commands run and their results")
+        if args.state == "review" and t["state"] in ("doing", "review"):
+            t["rounds"] += 1
+        if args.reviewer and args.reviewer not in t["reviewers"]:
+            t["reviewers"].append(args.reviewer)
+        if args.state:
+            t["state"] = args.state
+        t["updated"] = now()
+        run.write("tasks.json", tasks)
+    limit = load_config()["limits"]["max_review_rounds"]
+    warn = f"  (review round {t['rounds']} > limit {limit}: escalate)" if t["rounds"] > limit else ""
+    out(args, t, f"{t['id']} -> {t['state']}{warn}")
+
+
+def cmd_task_list(args):
+    run = resolve_run(args)
+    tasks = run.read("tasks.json", {})
+    if args.ready:
+        tasks = {k: t for k, t in tasks.items() if t["state"] == "todo"
+                 and all(tasks[d]["state"] == "done" for d in t["deps"])}
+    if args.json:
+        return out(args, tasks)
+    for t in tasks.values():
+        print(f"{t['id']:<5} {t['state']:<8} owner={t.get('owner') or '-':<12} deps={','.join(t['deps']) or '-'} "
+              f"paths={','.join(t['paths']) or '-'}  {t['title']}")
+
+
+# ---------- jev sizing ----------
+
+TIERS = {
+    "solo": "Trivial or one obvious edit in one file; the manager does it inline, no agents",
+    "pair": "One focused change; one worker plus one cross-model reviewer",
+    "squad": "A feature or fix touching a few files or 2-4 independent units; small team with review and tests",
+    "team": "Multi-component work, 5-12 independent units or several repos; parallel workers, review pool, testers",
+    "swarm": "Large fan-out: 13+ independent units (bulk audits, many services, many generators); big parallel pool",
+}
+INTENTS = {
+    "question": "The user asks a question, wants an opinion, or wants an explanation; no code change requested",
+    "plan_only": "The user wants a plan, spec, ADR or design doc and explicitly not implementation yet",
+    "review_only": "The user wants existing code or changes reviewed, audited or checked; no edits unless asked later",
+    "execute": "The user wants code, config or docs changed (feature, fix, refactor)",
+    "ops_loop": "The user wants something triggered, run, deployed or monitored and fixed until it works",
+}
+
+
+def jev_bin():
+    return os.environ.get("ZSTACK_JEV") or shutil.which("jev")
+
+
+def call_jev(payload, timeout=90):
+    exe = jev_bin()
+    if not exe:
+        return None, "jev not found"
+    try:
+        p = subprocess.run([exe], input=json.dumps(payload), capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "jev timed out"
+    except OSError as e:
+        return None, f"jev failed to start: {e}"
+    if p.returncode != 0:
+        return None, (p.stderr or p.stdout).strip()[:300]
+    try:
+        return json.loads(p.stdout), None
+    except json.JSONDecodeError:
+        return None, "jev returned non-JSON"
+
+
+def noul(ans):
+    """Jev nouls come back as {"type": "noul", "noul": 0.94}."""
+    return float(ans.get("noul", ans.get("probability", 0.5)))
+
+
+def unresolved(ans):
+    if not ans or "probabilities" not in ans:
+        return True
+    probs = sorted(ans["probabilities"].values(), reverse=True)
+    return ans.get("confidence", 0) < 0.6 or (len(probs) > 1 and probs[0] - probs[1] < 0.15) or ans.get("choice") == "none"
+
+
+def fallback_tier(units):
+    if units <= 1:
+        return "pair"
+    if units <= 4:
+        return "squad"
+    if units <= 12:
+        return "team"
+    return "swarm"
+
+
+WORKER_CAP = {"pair": 1, "squad": 4, "team": 12, "swarm": 60}
+
+
+def shape(tier, w, risky):
+    r = 1 if risky else 0                 # extra security/contract reviewer persona
+    if tier == "pair":
+        return dict(worker=1, reviewer=1 + r)
+    if tier == "squad":
+        return dict(scout=min(2, w), worker=w, reviewer=2 + r, tester=1, verifier=1)
+    if tier == "team":
+        return dict(scout=min(4, math.ceil(w / 3)), planner=1, worker=w, reviewer=max(2, math.ceil(w / 3)) + r,
+                    tester=max(1, math.ceil(w / 4)), verifier=1, scribe=1)
+    if tier == "swarm":
+        return dict(scout=min(10, math.ceil(w / 4)), planner=1, worker=w, reviewer=math.ceil(w / 3) + r,
+                    tester=math.ceil(w / 5), verifier=1, scribe=1)
+    return {}
+
+
+def allocate(tier, units, risky, ui, budget):
+    """Deterministic team shape. Jev picks the tier; code does the arithmetic and enforces the budget."""
+    w = min(max(units, 1), WORKER_CAP.get(tier, 0))
+    c = shape(tier, w, risky)
+    while w > 1 and sum(c.values()) > budget:
+        w -= 1
+        c = shape(tier, w, risky)
+    if ui and c:
+        c["tester"] = max(c.get("tester", 0), 1)
+    # Still over budget with one worker (a small user override): drop support roles,
+    # least essential first, but keep one worker and one reviewer.
+    floor = {"worker": 1, "reviewer": 1}
+    for role in ("scribe", "scout", "planner", "tester", "verifier", "reviewer"):
+        while sum(c.values()) > budget and c.get(role, 0) > floor.get(role, 0):
+            c[role] -= 1
+    return {k: v for k, v in c.items() if v}
+
+
+def cmd_size(args):
+    cfg = load_config()
+    facts = json.loads(Path(args.file).read_text() if args.file else sys.stdin.read())
+    units = int(facts.get("units", 1))
+    run = None
+    try:
+        run = resolve_run(args)
+    except ZError:
+        pass
+    max_agents = run.meta["max_agents"] if run else cfg["limits"]["max_agents"]
+    reserve = min(cfg["limits"]["reserve"], max(max_agents // 10, 0))
+    state = {
+        "request": facts.get("request", ""),
+        "evidence": {k: v for k, v in facts.items() if k not in ("request", "override")},
+        "policy": "Use the smallest team that finishes reliably. The user dislikes heavy ceremony on small asks "
+                  "and dislikes agents editing code when only a question, plan or review was asked.",
+    }
+    payload = {"state": state, "questions": {
+        "intent": {"type": "choice", "instructions": "What does `request` ask the agents to do?",
+                   "criteria": {**INTENTS, "none": "Unclear; the user must be asked"}},
+        "tier": {"type": "choice", "instructions": "Which team size fits `request` given `evidence` (units = independent work units the manager found)?",
+                 "criteria": {**TIERS, "none": "Not enough evidence to size the work"}},
+        "risky": {"type": "noul", "instructions": "Does `request` touch auth, payments, data deletion or migration, infrastructure, secrets, or a public API/response contract?"},
+        "ambiguous": {"type": "noul", "instructions": "Is `request` ambiguous enough that a wrong assumption would waste significant work or change behavior the user did not ask for?"},
+        "ui": {"type": "noul", "instructions": "Does `request` change a user interface that should be checked in a browser or on a device?"},
+    }}
+    ans, err = (None, "skipped (--no-jev)") if args.no_jev else call_jev(payload)
+    if ans:
+        intent = ans["intent"]["choice"]
+        tier = ans["tier"]["choice"]
+        risky = noul(ans["risky"]) >= 0.5
+        ambiguous = noul(ans["ambiguous"])
+        ui = noul(ans["ui"]) >= 0.5
+        needs_more = unresolved(ans["intent"]) or unresolved(ans["tier"])
+    else:
+        intent, tier, risky, ui, ambiguous, needs_more = "none", fallback_tier(units), True, False, 1.0, True
+    if tier == "none":
+        tier = fallback_tier(units)
+    if intent == "question":
+        tier = "solo"
+    override = facts.get("override") or {}
+    budget = min(int(override.get("agents", max_agents - reserve)), max_agents)
+    counts = allocate(override.get("tier", tier), units, risky, ui, budget)
+    if intent == "review_only":
+        counts = {k: v for k, v in counts.items() if k in ("scout", "reviewer", "tester", "verifier")} or {"reviewer": 1}
+    if intent == "plan_only":
+        counts = {"scout": counts.get("scout", 1) or 1, "planner": 1, "reviewer": 1}
+    flow = {"question": "answer", "plan_only": "plan", "review_only": "review", "ops_loop": "ops",
+            "execute": "plan-gate" if (risky or ambiguous >= 0.5 or tier in ("team", "swarm")) else "direct",
+            "none": "ask-user"}[intent]
+    result = {
+        "intent": intent, "tier": override.get("tier", tier), "flow": flow, "risky": risky, "ui": ui,
+        "ambiguous": round(ambiguous, 2),
+        "counts": counts, "total": sum(counts.values()),
+        "max_parallel": run.meta["max_parallel"] if run else cfg["limits"]["max_parallel"],
+        "reserve": reserve, "needs_more_evidence": needs_more,
+        "jev": ans if ans else f"unavailable: {err}",
+    }
+    if run:
+        run.append("decisions.jsonl", {"ts": now(), "by": me(args), "question": "size", "facts": facts, "result": result})
+    out(args, result)
+
+
+def cmd_decide(args):
+    """Record a Jev decision made by any agent so the final report can show it."""
+    run = resolve_run(args)
+    rec = {"ts": now(), "by": me(args), "question": args.question, "choice": args.choice,
+           "confidence": args.confidence, "note": args.note}
+    run.append("decisions.jsonl", rec)
+    out(args, rec, f"logged: {args.question} -> {args.choice} ({args.confidence})")
+
+
+# ---------- rules ----------
+
+def rules_files(repo):
+    files = [ROOT / "rules/house.md", HOME / "rules/global.md"]
+    if repo:
+        files.append(HOME / "rules" / f"{slug(str(repo).strip('/'), 80)}.md")
+    return files
+
+
+def cmd_rule_add(args):
+    run = None
+    try:
+        run = resolve_run(args)
+    except ZError:
+        pass
+    repo = (args.repo or (run.meta["repo"] if run else os.getcwd())) if args.project else None
+    path = rules_files(repo)[2] if args.project else HOME / "rules/global.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as fh:
+        fh.write(f"- {args.text}  <!-- added {now()} -->\n")
+    print(f"rule added to {path}")
+
+
+def cmd_rule_list(args):
+    repo = args.repo or os.getcwd()
+    for f in rules_files(repo):
+        if f.exists():
+            print(f"## {f}\n{f.read_text().strip()}\n")
+
+
+def cmd_rule_forget(args):
+    hits = 0
+    for f in (HOME / "rules").glob("*.md"):
+        lines = f.read_text().splitlines(keepends=True)
+        keep = [l for l in lines if args.pattern.lower() not in l.lower()]
+        hits += len(lines) - len(keep)
+        f.write_text("".join(keep))
+    print(f"removed {hits} rule line(s) matching {args.pattern!r} (shipped rules/house.md is edited by hand)")
+
+
+# ---------- briefs and spawning ----------
+
+def strip_frontmatter(text):
+    return re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.S)
+
+
+def render_brief(run, aid, include_role):
+    agents = run.read("agents.json", {})
+    a = agents.get(aid)
+    if not a:
+        raise ZError(f"unknown agent {aid}")
+    tasks = run.read("tasks.json", {})
+    t = tasks.get(a.get("task") or "")
+    meta = run.meta
+    zs = f"{ROOT / 'bin/zstack'} --run {run.id} --as {aid}"
+    parts = [f"# zstack brief: {aid}\n",
+             f"- run: `{run.id}`  goal: {meta['goal']}",
+             f"- you are `{aid}` (role `{a['role']}`" + (f", persona: {a['persona']}" if a.get("persona") else "") + ")",
+             f"- repo: `{t.get('repo') if t and t.get('repo') else meta['repo']}`",
+             f"- git policy: {meta['policy']['git']}; worktree: {meta['policy']['worktree']}; deploy: {meta['policy']['deploy']}",
+             f"- run dir: `{run.dir}` (plans and artifacts go in `{run.dir}/artifacts/`; never commit it)",
+             f"- `$Z` below means `{zs}`. Type it in full in every shell call; variables don't persist.\n"]
+    if t:
+        parts += ["## Task contract",
+                  f"- id: {t['id']}  title: {t['title']}",
+                  f"- acceptance: {t.get('accept') or '(see manager message)'}",
+                  f"- owned paths: {', '.join(t['paths']) or '(manager will state)'}; do not edit outside them",
+                  f"- depends on: {', '.join(t['deps']) or 'nothing'}"]
+        for d in t["deps"]:
+            ev = tasks[d]["evidence"][-1]["text"] if tasks[d]["evidence"] else "(no evidence)"
+            parts.append(f"  - {d} handoff: {ev[:600]}")
+        parts.append("")
+    if include_role:
+        role_file = ROOT / "agents" / f"{a['role']}.md"
+        if role_file.exists():
+            parts += ["## Role", strip_frontmatter(role_file.read_text()).strip(), ""]
+        for skill in ("zstack-bus",):
+            sk = ROOT / "skills" / skill / "SKILL.md"
+            parts += [f"## Protocol ({skill})", strip_frontmatter(sk.read_text()).strip(), ""]
+    rules = "\n".join(f.read_text().strip() for f in rules_files(meta["repo"]) if f.exists())
+    parts += ["## House rules (always apply)", rules, ""]
+    pending = inbox(run, aid)
+    if pending:
+        parts += ["## Messages waiting for you", render_msgs(pending), ""]
+    parts += ["## Finish", "End with the report format from your role. "
+              f"Before you stop, send it: `{zs} msg send --to manager --kind done --ref {a.get('task') or '-'} --body '<report>'`."]
+    return "\n".join(parts)
+
+
+def cmd_brief(args):
+    run = resolve_run(args)
+    agents = run.read("agents.json", {})
+    a = agents.get(args.id)
+    if not a:
+        raise ZError(f"unknown agent {args.id}")
+    include_role = args.role or a["harness"] != "claude"
+    text = render_brief(run, args.id, include_role)
+    path = run.dir / "briefs" / f"{args.id}.md"
+    path.write_text(text)
+    print(text if not args.path_only else path)
+
+
+def launch_argv(cfg, run, a, brief_path):
+    h = cfg["harness"].get(a["harness"])
+    if not h:
+        raise ZError(f"no launch template for harness {a['harness']!r}")
+    tmpl = h["readonly_argv"] if a["role"] in READONLY_ROLES and "readonly_argv" in h else h["argv"]
+    t = run.read("tasks.json", {}).get(a.get("task") or "") or {}
+    subs = {"model": a["model"], "repo": t.get("repo") or run.meta["repo"], "brief": str(brief_path),
+            "root": str(ROOT), "role": a["role"], "run": str(run.dir),
+            "last": str(run.dir / "artifacts" / f"{a['id']}.last.md")}
+    return [os.path.expanduser(x.format(**subs)) for x in tmpl], bool(h.get("stdin"))
+
+
+def cmd_spawn(args):
+    cfg = load_config()
+    run = resolve_run(args)
+    agents = run.read("agents.json", {})
+    a = agents.get(args.id)
+    if not a:
+        raise ZError(f"unknown agent {args.id}; register it with `zstack agent add` first")
+    brief = run.dir / "briefs" / f"{a['id']}.md"
+    if a["state"] in ACTIVE and agent_alive(a):
+        raise ZError(f"{a['id']} is still running (pid {a['pid']})")
+    # Re-render on every launch so a re-spawned agent (fix round) sees its new findings.
+    if args.brief:
+        shutil.copy(args.brief, brief)
+    else:
+        brief.write_text(render_brief(run, a["id"], include_role=True))
+    argv, stdin = launch_argv(cfg, run, a, brief)
+    if args.dry_run:
+        return out(args, {"argv": argv, "stdin": stdin, "brief": str(brief)}, " ".join(argv) + (" < brief" if stdin else ""))
+    if not shutil.which(argv[0]):
+        raise ZError(f"{argv[0]} not on PATH")
+    active = sum(1 for x in agents.values() if x["state"] in ACTIVE and x["id"] != a["id"])
+    if active >= run.meta["max_parallel"]:
+        raise ZError(f"parallel cap reached: {active}/{run.meta['max_parallel']} active")
+    log = run.dir / "logs" / f"{a['id']}.log"
+    p = subprocess.Popen([sys.executable, str(ROOT / "bin/zstack"), "--run", run.id, "_run", a["id"]],
+                         stdout=open(log, "a"), stderr=subprocess.STDOUT, start_new_session=True,
+                         cwd=run.meta["repo"])
+    with run.locked():
+        agents = run.read("agents.json", {})
+        agents[a["id"]].update(pid=p.pid, state="running", updated=now(), log=str(log))
+        run.write("agents.json", agents)
+    out(args, {"id": a["id"], "pid": p.pid, "log": str(log)}, f"spawned {a['id']} pid={p.pid} log={log}")
+
+
+def cmd__run(args):
+    """Internal: run one headless agent, then post its final answer to the bus."""
+    cfg = load_config()
+    run = resolve_run(args)
+    a = run.read("agents.json", {})[args.id]
+    brief = run.dir / "briefs" / f"{a['id']}.md"
+    argv, stdin = launch_argv(cfg, run, a, brief)
+    env = {**os.environ, "ZSTACK_RUN": run.id, "ZSTACK_AGENT": a["id"]}
+    print(f"[{now()}] exec: {' '.join(argv)}", flush=True)
+    p = subprocess.run(argv, input=brief.read_text() if stdin else None, capture_output=True, text=True,
+                       env=env, cwd=run.meta["repo"])
+    sys.stdout.write(p.stdout)
+    sys.stderr.write(p.stderr)
+    last = run.dir / "artifacts" / f"{a['id']}.last.md"
+    final = last.read_text() if last.exists() else p.stdout[-8000:]
+    if not last.exists():
+        last.write_text(final)
+    state = "done" if p.returncode == 0 else "failed"
+    with run.locked():
+        agents = run.read("agents.json", {})
+        agents[a["id"]].update(state=state, updated=now(), note=f"exit {p.returncode}")
+        run.write("agents.json", agents)
+        seq = len(run.lines("bus.jsonl")) + 1
+        run.append("bus.jsonl", {"seq": seq, "ts": now(), "from": a["id"], "to": "manager",
+                                 "kind": "done" if state == "done" else "blocker", "ref": a.get("task"),
+                                 "body": f"[headless exit {p.returncode}; full answer: {last}]\n{final[-4000:]}"})
+
+
+# ---------- report / close ----------
+
+def cmd_report(args):
+    run = resolve_run(args)
+    m, agents, tasks = run.meta, run.read("agents.json", {}), run.read("tasks.json", {})
+    msgs, decisions = run.lines("bus.jsonl"), run.lines("decisions.jsonl")
+    L = [f"# zstack report: {m['goal']}", f"run `{m['id']}` · repo `{m['repo']}` · {m['state']}", ""]
+    roles = {}
+    for a in agents.values():
+        roles.setdefault(a["role"], []).append(f"{a['id']}({a['harness']}/{a['model']},{a['state']})")
+    L += ["## Team", f"{len(agents)} agents of max {m['max_agents']}"] + [f"- {r}: {', '.join(v)}" for r, v in roles.items()] + [""]
+    L += ["## Tasks", "| task | state | owner | rounds | evidence |", "|---|---|---|---|---|"]
+    for t in tasks.values():
+        ev = (t["evidence"][-1]["text"] if t["evidence"] else "none").replace("\n", " ").replace("|", "\\|")[:160]
+        L.append(f"| {t['id']} {t['title']} | {t['state']} | {t['owner'] or '-'} | {t['rounds']} | {ev} |")
+    blockers = [x for x in msgs if x["kind"] in ("blocker", "question")]
+    if blockers:
+        L += ["", "## Open blockers / questions"] + [f"- #{x['seq']} {x['from']}: {x['body'][:200]}" for x in blockers]
+    if decisions:
+        L += ["", "## Decisions", "| by | question | choice | confidence |", "|---|---|---|---|"]
+        for d in decisions:
+            if d["question"] == "size":
+                r = d["result"]
+                j = r["jev"]
+                conf = j["tier"]["confidence"] if isinstance(j, dict) else "Jev unavailable"
+                L.append(f"| {d['by']} | size | {r['intent']}/{r['tier']}/{r['flow']} {r['total']} agents | {conf} |")
+            else:
+                L.append(f"| {d['by']} | {d['question']} | {d['choice']} | {d.get('confidence')} |")
+    text = "\n".join(L)
+    (run.dir / "artifacts" / "report.md").write_text(text)
+    print(text)
+
+
+def cmd_close(args):
+    run = resolve_run(args)
+    with run.locked():
+        meta = run.meta
+        meta.update(state=args.state, closed=now())
+        run.write("meta.json", meta)
+    print(f"run {run.id} -> {args.state}")
+
+
+def cmd_runs(args):
+    runs_dir = HOME / "runs"
+    if not runs_dir.exists():
+        return
+    for d in sorted(runs_dir.iterdir())[-args.tail:]:
+        try:
+            m = json.loads((d / "meta.json").read_text())
+            print(f"{m['id']}  [{m['state']}]  {m['repo']}")
+        except (OSError, json.JSONDecodeError):
+            continue
+
+
+def cmd_up(args):
+    repo = str(Path(args.repo or os.getcwd()).resolve())
+    argv = ["claude", "--plugin-dir", str(ROOT), "--agent", "zstack:manager"] + args.extra
+    os.chdir(repo)
+    os.execvp(argv[0], argv)
+
+
+# ---------- argparse ----------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="zstack", description=__doc__)
+    p.add_argument("--run", help="run id (default: $ZSTACK_RUN or the last `zstack init`)")
+    p.add_argument("--as", dest="as_", help="act as this agent id (default: $ZSTACK_AGENT or manager)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("init", help="start a run")
+    s.add_argument("--goal", required=True)
+    s.add_argument("--repo")
+    s.add_argument("--max-agents", type=int)
+    s.add_argument("--max-parallel", type=int)
+    s.add_argument("--git", default="no-commit", help="no-commit | commit | commit-push (only what the user said)")
+    s.add_argument("--worktree", default="off", help="off | per-writer")
+    s.add_argument("--deploy", default="never", help="never | authorized")
+    s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("status", help="show agents, tasks and unread counts")
+    s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("runs", help="list recent runs")
+    s.add_argument("--tail", type=int, default=15)
+    s.set_defaults(fn=cmd_runs)
+
+    ag = sub.add_parser("agent").add_subparsers(dest="sub", required=True)
+    s = ag.add_parser("add", help="register an agent (enforces the 100-agent and parallel caps)")
+    s.add_argument("--role", required=True, choices=ROLES)
+    s.add_argument("--harness", choices=["claude", "codex", "omp", "pi", "opencode"])
+    s.add_argument("--model")
+    s.add_argument("--persona")
+    s.add_argument("--task")
+    s.add_argument("--planned", action="store_true", help="reserve a slot without counting it as active")
+    s.set_defaults(fn=cmd_agent_add)
+    s = ag.add_parser("set")
+    s.add_argument("id")
+    s.add_argument("--state", choices=["planned", "running", "waiting", "done", "failed", "blocked", "stopped"])
+    s.add_argument("--note")
+    s.add_argument("--session", help="harness session/agent id, used to resume the agent")
+    s.add_argument("--task")
+    s.set_defaults(fn=cmd_agent_set)
+    s = ag.add_parser("list")
+    s.set_defaults(fn=cmd_agent_list)
+
+    mg = sub.add_parser("msg").add_subparsers(dest="sub", required=True)
+    s = mg.add_parser("send")
+    s.add_argument("--to", required=True, help="agent id | manager | all | role:<role>")
+    s.add_argument("--kind", required=True)
+    s.add_argument("--ref", help="task id this message is about")
+    s.add_argument("--body")
+    s.add_argument("--file")
+    s.set_defaults(fn=cmd_msg_send)
+    s = mg.add_parser("inbox")
+    s.add_argument("--peek", action="store_true", help="do not mark as read")
+    s.add_argument("--all", action="store_true", help="include already-read messages")
+    s.add_argument("--kind")
+    s.set_defaults(fn=cmd_msg_inbox)
+    s = mg.add_parser("wait", help="block until a message arrives (exit 2 on timeout)")
+    s.add_argument("--timeout", type=float, default=600)
+    s.add_argument("--interval", type=float, default=2)
+    s.add_argument("--kind", help="comma-separated kinds to wait for")
+    s.set_defaults(fn=cmd_msg_wait)
+    s = mg.add_parser("log")
+    s.add_argument("--tail", type=int, default=30)
+    s.add_argument("--kind")
+    s.set_defaults(fn=cmd_msg_log)
+
+    tk = sub.add_parser("task").add_subparsers(dest="sub", required=True)
+    s = tk.add_parser("add")
+    s.add_argument("--title", required=True)
+    s.add_argument("--accept", help="acceptance criteria")
+    s.add_argument("--deps", help="comma-separated task ids")
+    s.add_argument("--paths", help="comma-separated owned paths (relative to repo)")
+    s.add_argument("--repo", help="repo for this task when the run spans several")
+    s.set_defaults(fn=cmd_task_add)
+    s = tk.add_parser("claim", help="take a task (checks deps and path overlap)")
+    s.add_argument("id")
+    s.add_argument("--owner")
+    s.set_defaults(fn=cmd_task_claim)
+    s = tk.add_parser("set")
+    s.add_argument("id")
+    s.add_argument("--state", choices=TASK_STATES)
+    s.add_argument("--evidence")
+    s.add_argument("--reviewer")
+    s.set_defaults(fn=cmd_task_set)
+    s = tk.add_parser("list")
+    s.add_argument("--ready", action="store_true")
+    s.set_defaults(fn=cmd_task_list)
+
+    s = sub.add_parser("size", help="ask Jev to size the work; reads facts JSON from --file or stdin")
+    s.add_argument("--file")
+    s.add_argument("--no-jev", action="store_true")
+    s.set_defaults(fn=cmd_size)
+    s = sub.add_parser("decide", help="log a Jev decision into the run")
+    s.add_argument("--question", required=True)
+    s.add_argument("--choice", required=True)
+    s.add_argument("--confidence")
+    s.add_argument("--note")
+    s.set_defaults(fn=cmd_decide)
+
+    rl = sub.add_parser("rule").add_subparsers(dest="sub", required=True)
+    s = rl.add_parser("add", help="remember a rule for every future agent brief")
+    s.add_argument("text")
+    s.add_argument("--project", action="store_true", help="only for this repo")
+    s.add_argument("--repo")
+    s.set_defaults(fn=cmd_rule_add)
+    s = rl.add_parser("list")
+    s.add_argument("--repo")
+    s.set_defaults(fn=cmd_rule_list)
+    s = rl.add_parser("forget")
+    s.add_argument("pattern")
+    s.set_defaults(fn=cmd_rule_forget)
+
+    s = sub.add_parser("brief", help="render the standard brief for an agent")
+    s.add_argument("id")
+    s.add_argument("--role", action="store_true", help="include role prompt even for claude subagents")
+    s.add_argument("--path-only", action="store_true")
+    s.set_defaults(fn=cmd_brief)
+    s = sub.add_parser("spawn", help="start a registered agent as a headless process on its harness")
+    s.add_argument("id")
+    s.add_argument("--brief", help="use this brief file instead of the rendered one")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_spawn)
+    s = sub.add_parser("_run")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd__run)
+
+    s = sub.add_parser("report", help="write the run report (artifacts/report.md)")
+    s.set_defaults(fn=cmd_report)
+    s = sub.add_parser("close")
+    s.add_argument("--state", default="done", choices=["done", "awaiting_approval", "blocked", "cancelled"])
+    s.set_defaults(fn=cmd_close)
+    s = sub.add_parser("up", help="start the manager: claude --plugin-dir <zstack> --agent zstack:manager")
+    s.add_argument("--repo")
+    s.add_argument("extra", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_up)
+    add_global_flags_everywhere(p)
+    return p
+
+
+def add_global_flags_everywhere(parser):
+    """Accept --run/--as/--json after the subcommand too (`zstack msg inbox --run R`)."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for sp in action.choices.values():
+                if not any(isinstance(a, argparse._SubParsersAction) for a in sp._actions):
+                    sp.add_argument("--run", default=argparse.SUPPRESS)
+                    sp.add_argument("--as", dest="as_", default=argparse.SUPPRESS)
+                    sp.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+                add_global_flags_everywhere(sp)
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        args.fn(args)
+    except ZError as e:
+        print(f"zstack: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

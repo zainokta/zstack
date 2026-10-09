@@ -1,0 +1,96 @@
+# zstack configuration. Copy to ~/.local/state/zstack/zstack.toml to override per machine.
+
+[limits]
+max_agents = 100        # agents spawned per run, manager excluded. Hard ceiling: 100.
+max_parallel = 8        # agents running at once. Lower it when you hit rate limits.
+reserve = 10            # slots kept free for repair, debugger and re-review agents
+max_review_rounds = 3   # review -> fix -> re-review rounds before the manager escalates
+
+# Role -> where the agent runs. `harness = "claude"` means an in-session Claude Code
+# subagent (manager uses the Agent tool with `agent`). Any other harness is a headless
+# process started by `zstack spawn`. Reviewers default to a different model family than
+# workers so that review is cross-model.
+[roles.scout]
+harness = "claude"
+agent = "zstack:scout"
+model = "haiku"
+
+[roles.planner]
+harness = "claude"
+agent = "zstack:planner"
+model = "opus"
+
+[roles.worker]
+harness = "claude"
+agent = "zstack:worker"
+model = "sonnet"
+
+[roles.reviewer]
+harness = "codex"
+agent = "zstack:reviewer"
+model = "gpt-6-sol"
+
+[roles.tester]
+harness = "claude"
+agent = "zstack:tester"
+model = "sonnet"
+
+[roles.debugger]
+harness = "claude"
+agent = "zstack:debugger"
+model = "opus"
+
+[roles.operator]
+harness = "claude"
+agent = "zstack:operator"
+model = "sonnet"
+
+[roles.verifier]
+harness = "claude"
+agent = "zstack:verifier"
+model = "opus"
+
+[roles.scribe]
+harness = "claude"
+agent = "zstack:scribe"
+model = "haiku"
+
+# Headless launch templates. Placeholders: {model} {repo} {run} {brief} {root} {role} {last}.
+# `default_model` is used when an agent is moved to this harness without --model.
+# `stdin = true` pipes the brief on stdin; otherwise the brief is passed as a file.
+# `readonly_argv` replaces `argv` for read-only roles (scout, reviewer, verifier).
+# Headless agents run under `zstack _run`, which captures the final answer ({last} or
+# stdout) and posts it to the bus as a `done` message. Read-only sandboxes therefore
+# never strictly need to write the bus themselves.
+[harness.claude]
+default_model = "sonnet"
+argv = ["claude", "-p", "--plugin-dir", "{root}", "--agent", "zstack:{role}", "--model", "{model}", "--permission-mode", "auto"]
+readonly_argv = ["claude", "-p", "--plugin-dir", "{root}", "--agent", "zstack:{role}", "--model", "{model}", "--permission-mode", "auto", "--disallowedTools", "Edit", "Write", "NotebookEdit"]
+stdin = true
+
+# Writers: the repo plus the run dir are writable. Read-only roles start in the run dir,
+# so the bus is writable but the repo is not (they read it via absolute paths / git -C).
+# Network is on so Jev works inside the sandbox.
+[harness.codex]
+default_model = "gpt-6-sol"
+argv = ["codex", "exec", "-m", "{model}", "-C", "{repo}", "-s", "workspace-write", "--add-dir", "{run}", "--add-dir", "~/.local/state/jev", "-c", "sandbox_workspace_write.network_access=true", "--skip-git-repo-check", "-o", "{last}", "-"]
+readonly_argv = ["codex", "exec", "-m", "{model}", "-C", "{run}", "-s", "workspace-write", "--add-dir", "~/.local/state/jev", "-c", "sandbox_workspace_write.network_access=true", "--skip-git-repo-check", "-o", "{last}", "-"]
+stdin = true
+
+[harness.omp]
+default_model = "commandcode/deepseek/deepseek-v4.1-flash"
+argv = ["omp", "-p", "--model", "{model}", "--cwd", "{repo}", "@{brief}", "Follow the attached zstack brief exactly."]
+readonly_argv = ["omp", "-p", "--model", "{model}", "--cwd", "{repo}", "--tools", "read,bash", "@{brief}", "Follow the attached zstack brief exactly. Read-only: do not edit files."]
+stdin = false
+
+[harness.pi]
+default_model = "openai-codex/gpt-6-luna"
+argv = ["pi", "-p", "--model", "{model}", "@{brief}", "Follow the attached zstack brief exactly."]
+readonly_argv = ["pi", "-p", "--model", "{model}", "--tools", "read,grep,find,ls,bash", "@{brief}", "Follow the attached zstack brief exactly. Read-only: do not edit files."]
+stdin = false
+
+[harness.opencode]
+default_model = "opencode-go/deepseek-v4.1-flash"
+argv = ["opencode", "run", "--model", "{model}", "--dir", "{repo}", "-f", "{brief}", "--", "Follow the attached zstack brief exactly."]
+readonly_argv = ["opencode", "run", "--model", "{model}", "--dir", "{repo}", "--agent", "plan", "-f", "{brief}", "--", "Follow the attached zstack brief exactly. Read-only: do not edit files."]
+stdin = false
