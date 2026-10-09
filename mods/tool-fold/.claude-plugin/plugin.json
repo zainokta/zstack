@@ -1,0 +1,6 @@
+{
+  "name": "tool-fold",
+  "version": "0.1.0",
+  "description": "Click a tool call's ▸ to expand its full command, file, diff or prompt (and full Bash output); click ▾ to collapse.",
+  "types": "./types/index.d.ts"
+}

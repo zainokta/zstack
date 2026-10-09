@@ -1,0 +1,67 @@
+{
+  "name": "zstack",
+  "owner": {
+    "name": "zainokta"
+  },
+  "metadata": {
+    "description": "zstack manager-led agent team plus Claude Code mods built from the user's own usage.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "zstack",
+      "description": "Manager-led agent team: one manager sizes work with Jev and coordinates up to 100 scouts, planners, workers, reviewers, testers, debuggers, operators, verifiers and scribes over a shared message bus.",
+      "source": "./"
+    },
+    {
+      "name": "evidence-check",
+      "description": "Flags replies that claim tests pass, fixed or verified when no test, build, lint, curl or DB check ran that turn.",
+      "source": "./mods/evidence-check"
+    },
+    {
+      "name": "intent-gate",
+      "description": "Classifies each prompt's intent with Jev (question, plan, review, execute, ops) and blocks file edits and git writes on question, plan and review turns.",
+      "source": "./mods/intent-gate"
+    },
+    {
+      "name": "loop-breaker",
+      "description": "Notices the same failure coming back (a Bash command failing the same way, or the same error pasted again) and tells Claude to stop patching and diagnose.",
+      "source": "./mods/loop-breaker"
+    },
+    {
+      "name": "rules-injector",
+      "description": "Puts your zstack standing rules (house, global, project) into every system prompt, so you stop repeating them. /rules lists, adds and forgets them.",
+      "source": "./mods/rules-injector"
+    },
+    {
+      "name": "secret-vault",
+      "description": "Replaces secrets pasted into prompts with \u27e8secret:N\u27e9 placeholders, puts the real values back only inside tool calls, and masks them again in tool output.",
+      "source": "./mods/secret-vault"
+    },
+    {
+      "name": "ship-state",
+      "description": "One line above the prompt: branch, ahead/behind upstream, dirty counts and the last test result, so 'is it pushed?' answers itself.",
+      "source": "./mods/ship-state"
+    },
+    {
+      "name": "tool-fold",
+      "description": "Click a tool call's \u25b8 to expand its full command, file, diff or prompt (and full Bash output); click \u25be to collapse.",
+      "source": "./mods/tool-fold"
+    },
+    {
+      "name": "turn-done-alert",
+      "description": "Toasts when a long turn finishes or Claude is waiting on you, and shows a 'working 3m \u00b7 14 tools' heartbeat during long turns.",
+      "source": "./mods/turn-done-alert"
+    },
+    {
+      "name": "usage-meter",
+      "description": "Status line with context fill and rate-limit use: ctx 42% 84k/200k \u00b7 5h 63% \u00b7 7d 12%.",
+      "source": "./mods/usage-meter"
+    },
+    {
+      "name": "zstack-pane",
+      "description": "/zstack-pane (or /zs) opens a live pane of the current zstack run: agents, tasks, recent blockers and questions, and a field to steer all agents.",
+      "source": "./mods/zstack-pane"
+    }
+  ]
+}

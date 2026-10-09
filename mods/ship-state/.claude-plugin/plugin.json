@@ -1,0 +1,7 @@
+{
+  "name": "ship-state",
+  "version": "0.1.0",
+  "description": "One line above the prompt: branch, ahead/behind upstream, dirty counts and the last test result, so 'is it pushed?' answers itself.",
+  "author": { "name": "zainokta" },
+  "types": "./types/index.d.ts"
+}

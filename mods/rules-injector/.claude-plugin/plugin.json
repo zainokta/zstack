@@ -1,0 +1,6 @@
+{
+  "name": "rules-injector",
+  "version": "0.1.0",
+  "description": "Puts your zstack standing rules (house, global, project) into every system prompt, so you stop repeating them. /rules lists, adds and forgets them.",
+  "author": { "name": "zainokta" }
+}

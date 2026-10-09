@@ -1,0 +1,7 @@
+{
+  "name": "intent-gate",
+  "version": "0.1.0",
+  "description": "Classifies each prompt's intent with Jev (question, plan, review, execute, ops) and blocks file edits and git writes on question, plan and review turns.",
+  "author": { "name": "zainokta" },
+  "types": "./types/index.d.ts"
+}

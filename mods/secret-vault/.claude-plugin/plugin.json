@@ -1,0 +1,7 @@
+{
+  "name": "secret-vault",
+  "version": "0.1.0",
+  "description": "Replaces secrets pasted into prompts with ⟨secret:N⟩ placeholders, puts the real values back only inside tool calls, and masks them again in tool output.",
+  "author": { "name": "zainokta" },
+  "types": "./types/index.d.ts"
+}

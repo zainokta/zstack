@@ -1,0 +1,6 @@
+{
+  "name": "usage-meter",
+  "version": "0.1.0",
+  "description": "Status line with context fill and rate-limit use: ctx 42% 84k/200k · 5h 63% · 7d 12%.",
+  "author": { "name": "zainokta" }
+}

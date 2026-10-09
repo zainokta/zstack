@@ -1,0 +1,7 @@
+{
+  "name": "zstack-pane",
+  "version": "0.1.0",
+  "description": "/zstack-pane (or /zs) opens a live pane of the current zstack run: agents, tasks, recent blockers and questions, and a field to steer all agents.",
+  "author": { "name": "zainokta" },
+  "types": "./types/index.d.ts"
+}

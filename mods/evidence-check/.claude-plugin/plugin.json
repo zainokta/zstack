@@ -1,0 +1,7 @@
+{
+  "name": "evidence-check",
+  "version": "0.1.0",
+  "description": "Flags replies that claim tests pass, fixed or verified when no test, build, lint, curl or DB check ran that turn.",
+  "author": { "name": "zainokta" },
+  "types": "./types/index.d.ts"
+}

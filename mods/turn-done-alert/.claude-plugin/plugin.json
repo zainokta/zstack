@@ -1,0 +1,14 @@
+{
+  "name": "turn-done-alert",
+  "version": "0.1.0",
+  "description": "Toasts when a long turn finishes or Claude is waiting on you, and shows a 'working 3m · 14 tools' heartbeat during long turns.",
+  "author": { "name": "zainokta" },
+  "userConfig": {
+    "thresholdSeconds": {
+      "type": "number",
+      "title": "Long turn threshold (seconds)",
+      "description": "A turn at least this long raises a toast when it finishes.",
+      "default": 60
+    }
+  }
+}
