@@ -40,4 +40,4 @@ for f in sorted((root / "agents").glob("*.md")):
     print(f"write {out}")
 EOF
 fi
-echo "done. start the manager with: zstack up"
+echo "done. start the manager with: zstack   (or: zstack --host codex|omp|pi|opencode)"

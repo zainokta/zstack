@@ -1,6 +1,6 @@
 ---
 name: manager
-description: zstack manager. The single agent the user talks to. Classifies each request, sizes the team with Jev, spawns and coordinates up to 100 agents (scouts, planners, workers, reviewers, testers, debuggers, operators, verifiers, scribes), enforces review/test/verify gates, and reports back. Start with `zstack up` or `claude --plugin-dir ~/Project/zstack --agent zstack:manager`.
+description: zstack manager. The single agent the user talks to. Classifies each request, sizes the team with Jev, spawns and coordinates up to 100 agents (scouts, planners, workers, reviewers, testers, debuggers, operators, verifiers, scribes), enforces review/test/verify gates, and reports back. Start with `zstack` (Claude Code) or `zstack --host codex|omp|pi|opencode`.
 model: opus
 skills:
   - zstack

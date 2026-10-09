@@ -94,3 +94,52 @@ default_model = "opencode-go/deepseek-v4.1-flash"
 argv = ["opencode", "run", "--model", "{model}", "--dir", "{repo}", "-f", "{brief}", "--", "Follow the attached zstack brief exactly."]
 readonly_argv = ["opencode", "run", "--model", "{model}", "--dir", "{repo}", "--agent", "plan", "-f", "{brief}", "--", "Follow the attached zstack brief exactly. Read-only: do not edit files."]
 stdin = false
+
+# Host profiles: role routing when the manager runs in another harness
+# (`zstack --host <host>`, recorded by `zstack init`). Unlisted roles fall back to
+# [roles.*] above. Each profile mirrors the setup you already run in that harness
+# (Codex luna/sol lanes, omp's Command Code roles, pi's openai-codex models), and
+# keeps reviewers and the verifier in a different model family from the workers.
+[hosts.codex.roles]
+scout    = { harness = "codex", model = "gpt-6-luna" }
+planner  = { harness = "codex", model = "gpt-6-sol" }
+worker   = { harness = "codex", model = "gpt-6-luna" }
+reviewer = { harness = "claude", model = "sonnet" }
+tester   = { harness = "codex", model = "gpt-6-luna" }
+debugger = { harness = "codex", model = "gpt-6-sol" }
+operator = { harness = "codex", model = "gpt-6-luna" }
+verifier = { harness = "claude", model = "opus" }
+scribe   = { harness = "codex", model = "gpt-6-luna" }
+
+[hosts.omp.roles]
+scout    = { harness = "omp", model = "commandcode/gpt-6-luna" }
+planner  = { harness = "omp", model = "commandcode/z-ai/glm-5.3-flash" }
+worker   = { harness = "omp", model = "commandcode/deepseek/deepseek-v4.1-flash" }
+reviewer = { harness = "codex", model = "gpt-6-sol" }
+tester   = { harness = "omp", model = "commandcode/deepseek/deepseek-v4.1-flash" }
+debugger = { harness = "omp", model = "openai-codex/gpt-6.1-sol" }
+operator = { harness = "omp", model = "commandcode/deepseek/deepseek-v4.1-flash" }
+verifier = { harness = "claude", model = "opus" }
+scribe   = { harness = "omp", model = "commandcode/gpt-6-luna" }
+
+[hosts.pi.roles]
+scout    = { harness = "pi", model = "openai-codex/gpt-6-luna" }
+planner  = { harness = "pi", model = "openai-codex/gpt-6-sol" }
+worker   = { harness = "pi", model = "openai-codex/gpt-6-luna" }
+reviewer = { harness = "claude", model = "sonnet" }
+tester   = { harness = "pi", model = "openai-codex/gpt-6-luna" }
+debugger = { harness = "pi", model = "openai-codex/gpt-6-sol" }
+operator = { harness = "pi", model = "openai-codex/gpt-6-luna" }
+verifier = { harness = "claude", model = "opus" }
+scribe   = { harness = "pi", model = "openai-codex/gpt-6-luna" }
+
+[hosts.opencode.roles]
+scout    = { harness = "opencode", model = "opencode-go/deepseek-v4.1-flash" }
+planner  = { harness = "codex", model = "gpt-6-sol" }
+worker   = { harness = "opencode", model = "opencode-go/deepseek-v4.1-flash" }
+reviewer = { harness = "codex", model = "gpt-6-sol" }
+tester   = { harness = "opencode", model = "opencode-go/deepseek-v4.1-flash" }
+debugger = { harness = "codex", model = "gpt-6-sol" }
+operator = { harness = "opencode", model = "opencode-go/deepseek-v4.1-flash" }
+verifier = { harness = "claude", model = "opus" }
+scribe   = { harness = "opencode", model = "opencode-go/deepseek-v4.1-flash" }

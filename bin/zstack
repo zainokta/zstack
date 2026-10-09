@@ -23,6 +23,8 @@ ROOT = Path(__file__).resolve().parent.parent
 HOME = Path(os.environ.get("ZSTACK_HOME", Path.home() / ".local/state/zstack"))
 HARD_MAX_AGENTS = 100
 ROLES = ["scout", "planner", "worker", "reviewer", "tester", "debugger", "operator", "verifier", "scribe"]
+HOSTS = ("claude", "codex", "omp", "pi", "opencode")
+SANDBOXED_HOSTS = {"codex"}
 READONLY_ROLES = {"scout", "reviewer", "verifier"}
 ACTIVE = {"running", "waiting"}
 TASK_STATES = ["todo", "doing", "review", "testing", "done", "failed", "blocked"]
@@ -138,6 +140,7 @@ def cmd_init(args):
         "max_agents": max_agents,
         "max_parallel": args.max_parallel or cfg["limits"]["max_parallel"],
         "policy": {"git": args.git, "worktree": args.worktree, "deploy": args.deploy},
+        "host": args.host or os.environ.get("ZSTACK_HOST") or "claude",
     }
     (d / "meta.json").write_text(json.dumps(meta, indent=2))
     (HOME / "current").write_text(run_id)
@@ -186,16 +189,17 @@ def cmd_status(args):
 
 # ---------- agents ----------
 
-def role_cfg(cfg, role):
+def role_cfg(cfg, role, host="claude"):
+    """Role routing: the host's profile ([hosts.<host>.roles.<role>]) over the defaults."""
     if role not in cfg["roles"]:
         raise ZError(f"unknown role {role!r}; known: {', '.join(cfg['roles'])}")
-    return cfg["roles"][role]
+    return {**cfg["roles"][role], **cfg.get("hosts", {}).get(host, {}).get("roles", {}).get(role, {})}
 
 
 def cmd_agent_add(args):
     cfg = load_config()
     run = resolve_run(args)
-    rc = role_cfg(cfg, args.role)
+    rc = role_cfg(cfg, args.role, run.meta.get("host", "claude"))
     with run.locked():
         agents = run.read("agents.json", {})
         meta = run.meta
@@ -329,7 +333,7 @@ def cmd_msg_log(args):
     run = resolve_run(args)
     msgs = run.lines("bus.jsonl")
     if args.kind:
-        msgs = [m for m in msgs if m["kind"] == args.kind]
+        msgs = [m for m in msgs if m["kind"] in args.kind.split(",")]
     out(args, msgs[-args.tail:], render_msgs(msgs[-args.tail:]))
 
 
@@ -729,15 +733,51 @@ def cmd_spawn(args):
     active = sum(1 for x in agents.values() if x["state"] in ACTIVE and x["id"] != a["id"])
     if active >= run.meta["max_parallel"]:
         raise ZError(f"parallel cap reached: {active}/{run.meta['max_parallel']} active")
-    log = run.dir / "logs" / f"{a['id']}.log"
-    p = subprocess.Popen([sys.executable, str(ROOT / "bin/zstack"), "--run", run.id, "_run", a["id"]],
+    if os.environ.get("ZSTACK_DISPATCH"):
+        # Inside a host sandbox (Codex) whose processes die when this command returns:
+        # queue the launch for the dispatcher the host launcher started outside the sandbox.
+        queue = HOME / "queue"
+        queue.mkdir(exist_ok=True)
+        (queue / f"{time.time_ns()}-{run.id}-{a['id']}.json").write_text(json.dumps({"run": run.id, "id": a["id"]}))
+        with run.locked():
+            agents = run.read("agents.json", {})
+            agents[a["id"]].update(state="running", updated=now(), note="queued for dispatcher")
+            run.write("agents.json", agents)
+        return out(args, {"id": a["id"], "queued": True}, f"queued {a['id']} (the dispatcher starts it)")
+    pid, log = start_agent(run, a["id"])
+    out(args, {"id": a["id"], "pid": pid, "log": str(log)}, f"spawned {a['id']} pid={pid} log={log}")
+
+
+def start_agent(run, aid):
+    log = run.dir / "logs" / f"{aid}.log"
+    p = subprocess.Popen([sys.executable, str(ROOT / "bin/zstack"), "--run", run.id, "_run", aid],
                          stdout=open(log, "a"), stderr=subprocess.STDOUT, start_new_session=True,
                          cwd=run.meta["repo"])
     with run.locked():
         agents = run.read("agents.json", {})
-        agents[a["id"]].update(pid=p.pid, state="running", updated=now(), log=str(log))
+        agents[aid].update(pid=p.pid, state="running", updated=now(), log=str(log), note=None)
         run.write("agents.json", agents)
-    out(args, {"id": a["id"], "pid": p.pid, "log": str(log)}, f"spawned {a['id']} pid={p.pid} log={log}")
+    return p.pid, log
+
+
+def cmd__dispatch(args):
+    """Internal: start queued agents until the host process `--parent` exits."""
+    queue = HOME / "queue"
+    queue.mkdir(parents=True, exist_ok=True)
+    while True:
+        for req in sorted(queue.glob("*.json")):
+            try:
+                job = json.loads(req.read_text())
+                req.unlink()
+                start_agent(Run(job["run"]), job["id"])
+            except (OSError, ValueError, KeyError, ZError) as e:
+                print(f"[{now()}] dispatch failed for {req.name}: {e}", file=sys.stderr, flush=True)
+                req.unlink(missing_ok=True)
+        try:
+            os.kill(args.parent, 0)
+        except OSError:
+            return
+        time.sleep(0.5)
 
 
 def cmd__run(args):
@@ -822,17 +862,84 @@ def cmd_runs(args):
             continue
 
 
-def cmd_up(args):
+MANAGER_SKILLS = ("zstack", "zstack-bus", "zstack-jev", "zstack-git")
+
+HOST_NOTE = """## Host: {host}
+
+You are the zstack manager running inside **{host}**, not Claude Code. There is no Claude Agent tool here.
+- `zstack` is `{z}`. This session has `ZSTACK_HOST={host}`, so `zstack init` routes roles with the `{host}` profile in config/zstack.toml.
+- Spawn every agent the same way: `zstack agent add --role <role> [--task tN]`, then `zstack spawn <id>`. Each runs headless on its configured harness and posts `done` or `blocker` to you when it exits.
+- Don't use {host}'s own subagent feature for zstack roles; the 100-agent cap and the bus only see agents spawned through zstack.
+- Wait for agents with `zstack msg wait --timeout 900` (exit 2 = timeout: check `zstack status`, then wait again).
+- Fix rounds: run `zstack spawn <id>` again. Its brief is re-rendered with the new findings.
+- Ask the user in chat with numbered, lettered options (there is no AskUserQuestion dialog)."""
+
+
+def manager_prompt(host):
+    parts = [strip_frontmatter((ROOT / "agents/manager.md").read_text()).strip()]
+    parts += [strip_frontmatter((ROOT / "skills" / sk / "SKILL.md").read_text()).strip() for sk in MANAGER_SKILLS]
+    parts.append(HOST_NOTE.format(host=host, z=ROOT / "bin/zstack"))
+    return "\n\n---\n\n".join(parts)
+
+
+def host_argv(host, prompt_file, extra):
+    """argv and env that start an interactive manager session on `host`."""
+    state_dirs = [HOME, Path.home() / ".local/state/jev", Path.home() / ".claude", Path.home() / ".codex",
+                  Path.home() / ".omp", Path.home() / ".pi", Path.home() / ".local/share/opencode"]
+    if host == "claude":
+        return ["claude", "--plugin-dir", str(ROOT), "--agent", "zstack:manager", *extra], {}
+    if host == "codex":
+        # The manager's shell launches other harnesses, which write their own state dirs and need network.
+        adds = [a for d in state_dirs if d.exists() for a in ("--add-dir", str(d))]
+        return ["codex", "-c", f"developer_instructions={json.dumps(prompt_file.read_text())}", "-s", "workspace-write",
+                "-c", "sandbox_workspace_write.network_access=true", *adds, *extra], {}
+    if host in ("omp", "pi"):
+        return [host, "--append-system-prompt", str(prompt_file), *extra], {}
+    if host == "opencode":
+        agent = {"agent": {"zstack-manager": {"mode": "primary", "description": "zstack manager",
+                                              "prompt": "{file:" + str(prompt_file) + "}"}}}
+        return ["opencode", "--agent", "zstack-manager", *extra], {"OPENCODE_CONFIG_CONTENT": json.dumps(agent)}
+    raise ZError(f"unknown host {host!r}; choose from {', '.join(HOSTS)}")
+
+
+def launch(argv):
+    """`zstack [--host H] [--repo DIR] [--dry-run] [-- harness args]`: start the manager."""
+    p = argparse.ArgumentParser(prog="zstack", description="Start the zstack manager. Other commands: zstack -h")
+    p.add_argument("--host", choices=HOSTS, default=os.environ.get("ZSTACK_HOST") or "claude")
+    p.add_argument("--repo")
+    p.add_argument("--dry-run", action="store_true", help="print the command instead of starting it")
+    args, extra = p.parse_known_args(argv)
+    extra = [x for x in extra if x != "--"]
     repo = str(Path(args.repo or os.getcwd()).resolve())
-    argv = ["claude", "--plugin-dir", str(ROOT), "--agent", "zstack:manager"] + args.extra
+    prompt_file = HOME / "hosts" / f"{args.host}-manager.md"
+    prompt_file.parent.mkdir(parents=True, exist_ok=True)
+    prompt_file.write_text(manager_prompt(args.host))
+    cmd, env = host_argv(args.host, prompt_file, extra)
+    if args.dry_run:
+        shown = [c if len(c) < 200 else c[:60] + f"...<{len(c)} chars>" for c in cmd]
+        print(json.dumps({"argv": shown, "env": list(env), "cwd": repo, "prompt": str(prompt_file)}, indent=2))
+        return
+    if not shutil.which(cmd[0]):
+        raise ZError(f"{cmd[0]} not on PATH")
     os.chdir(repo)
-    os.execvp(argv[0], argv)
+    env = {**os.environ, **env, "ZSTACK_HOST": args.host}
+    if args.host not in SANDBOXED_HOSTS:
+        os.execvpe(cmd[0], cmd, env)
+    # A sandboxed host kills a command's children when the command returns, so agents
+    # are started by a dispatcher that lives outside the sandbox for this session.
+    dispatcher = subprocess.Popen([sys.executable, str(ROOT / "bin/zstack"), "_dispatch", "--parent", str(os.getpid())],
+                                  stdout=open(HOME / "dispatch.log", "a"), stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        sys.exit(subprocess.run(cmd, env={**env, "ZSTACK_DISPATCH": "1"}).returncode)
+    finally:
+        dispatcher.terminate()
 
 
 # ---------- argparse ----------
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="zstack", description=__doc__)
+    p = argparse.ArgumentParser(prog="zstack", description=__doc__ + "\nRun `zstack` alone (or `zstack --host codex|omp|pi|opencode`) to start the manager.",
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run", help="run id (default: $ZSTACK_RUN or the last `zstack init`)")
     p.add_argument("--as", dest="as_", help="act as this agent id (default: $ZSTACK_AGENT or manager)")
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -846,6 +953,7 @@ def build_parser():
     s.add_argument("--git", default="no-commit", help="no-commit | commit | commit-push (only what the user said)")
     s.add_argument("--worktree", default="off", help="off | per-writer")
     s.add_argument("--deploy", default="never", help="never | authorized")
+    s.add_argument("--host", choices=HOSTS, help="harness the manager runs in (default: $ZSTACK_HOST or claude)")
     s.set_defaults(fn=cmd_init)
 
     s = sub.add_parser("status", help="show agents, tasks and unread counts")
@@ -955,16 +1063,15 @@ def build_parser():
     s = sub.add_parser("_run")
     s.add_argument("id")
     s.set_defaults(fn=cmd__run)
+    s = sub.add_parser("_dispatch")
+    s.add_argument("--parent", type=int, required=True)
+    s.set_defaults(fn=cmd__dispatch)
 
     s = sub.add_parser("report", help="write the run report (artifacts/report.md)")
     s.set_defaults(fn=cmd_report)
     s = sub.add_parser("close")
     s.add_argument("--state", default="done", choices=["done", "awaiting_approval", "blocked", "cancelled"])
     s.set_defaults(fn=cmd_close)
-    s = sub.add_parser("up", help="start the manager: claude --plugin-dir <zstack> --agent zstack:manager")
-    s.add_argument("--repo")
-    s.add_argument("extra", nargs=argparse.REMAINDER)
-    s.set_defaults(fn=cmd_up)
     add_global_flags_everywhere(p)
     return p
 
@@ -981,9 +1088,33 @@ def add_global_flags_everywhere(parser):
                 add_global_flags_everywhere(sp)
 
 
+def wants_launch(argv, commands):
+    """True when argv names no subcommand (`zstack`, `zstack --host codex`)."""
+    i = 0
+    launch_flags = {"--host", "--repo", "--dry-run"}
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("-h", "--help"):
+            return any(a.split("=")[0] in launch_flags for a in argv)  # `zstack --host codex -h` is launch help
+        if tok in ("--run", "--as", "--host", "--repo"):
+            i += 2
+            continue
+        if tok == "--":
+            return True
+        if not tok.startswith("-"):
+            return tok not in commands
+        i += 1
+    return True
+
+
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+    commands = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices
     try:
+        if wants_launch(argv, commands):
+            return launch(argv)
+        args = parser.parse_args(argv)
         args.fn(args)
     except ZError as e:
         print(f"zstack: {e}", file=sys.stderr)

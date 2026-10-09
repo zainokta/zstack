@@ -103,6 +103,13 @@ class ZstackTest(unittest.TestCase):
         p = self.z("msg", "wait", "--timeout", "0.3", "--interval", "0.1", ok=False)
         self.assertEqual(p.returncode, 2)
 
+    def test_msg_log_filters_several_kinds(self):
+        self.init()
+        for kind in ("blocker", "done", "question"):
+            self.z("msg", "send", "--to", "all", "--kind", kind, "--body", kind)
+        got = json.loads(self.z("--json", "msg", "log", "--kind", "blocker,question").stdout)
+        self.assertEqual([m["kind"] for m in got], ["blocker", "question"])
+
     def test_unknown_recipient_rejected(self):
         self.init()
         p = self.z("msg", "send", "--to", "ghost-9", "--kind", "x", "--body", "y", ok=False)
@@ -189,6 +196,46 @@ class ZstackTest(unittest.TestCase):
         self.assertEqual(a["model"], "gpt-6-sol")
         b = json.loads(self.z("--json", "agent", "add", "--role", "verifier").stdout)
         self.assertEqual(b["model"], "opus")
+
+    def test_bare_zstack_starts_claude_manager(self):
+        out = json.loads(self.z("--dry-run", "--repo", str(self.repo)).stdout)
+        self.assertEqual(out["argv"][:5], ["claude", "--plugin-dir", str(ZSTACK.parent.parent), "--agent", "zstack:manager"])
+        self.assertEqual(out["cwd"], str(self.repo))
+
+    def test_host_flag_builds_each_harness_launch(self):
+        expect = {"codex": "codex", "omp": "omp", "pi": "pi", "opencode": "opencode"}
+        for host, exe in expect.items():
+            out = json.loads(self.z("--host", host, "--dry-run").stdout)
+            self.assertEqual(out["argv"][0], exe)
+            prompt = Path(out["prompt"]).read_text()
+            self.assertIn(f"## Host: {host}", prompt)
+            self.assertIn("zstack spawn", prompt)
+        codex = json.loads(self.z("--host", "codex", "--dry-run").stdout)["argv"]
+        self.assertTrue(any(a.startswith("developer_instructions=") for a in codex))
+        self.assertIn("sandbox_workspace_write.network_access=true", codex)
+        oc = json.loads(self.z("--host", "opencode", "--dry-run").stdout)
+        self.assertEqual(oc["env"], ["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(oc["argv"][1:3], ["--agent", "zstack-manager"])
+
+    def test_extra_args_pass_through_to_harness(self):
+        out = json.loads(self.z("--host", "pi", "--dry-run", "--", "--model", "x/y").stdout)
+        self.assertEqual(out["argv"][-2:], ["--model", "x/y"])
+
+    def test_subcommands_still_parse_with_global_flags(self):
+        rid = self.init()
+        self.assertIn(rid, self.z("--run", rid, "status").stdout)
+        self.assertIn("Start the zstack manager", self.z("--help").stdout + self.z("--host", "codex", "--help").stdout)
+
+    def test_run_host_selects_role_profile(self):
+        self.z("init", "--goal", "g", "--repo", str(self.repo), "--host", "omp")
+        w = json.loads(self.z("--json", "agent", "add", "--role", "worker").stdout)
+        self.assertEqual((w["harness"], w["model"]), ("omp", "commandcode/deepseek/deepseek-v4.1-flash"))
+        r = json.loads(self.z("--json", "agent", "add", "--role", "reviewer").stdout)
+        self.assertEqual(r["harness"], "codex")
+        self.env["ZSTACK_HOST"] = "codex"
+        self.z("init", "--goal", "g2", "--repo", str(self.repo))
+        w2 = json.loads(self.z("--json", "agent", "add", "--role", "worker").stdout)
+        self.assertEqual((w2["harness"], w2["model"]), ("codex", "gpt-6-luna"))
 
     def test_spawn_dry_run_uses_readonly_template_for_reviewers(self):
         self.init()
