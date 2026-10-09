@@ -29,7 +29,7 @@ for f in sorted((root / "agents").glob("*.md")):
     text = f.read_text()
     desc = re.search(r"^description: (.*)$", text, re.M).group(1)
     body = re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.S).strip()
-    model = cfg["roles"][role]["model"] if cfg["roles"][role]["harness"] == "codex" else "gpt-6-luna"
+    model = cfg["hosts"]["codex"]["roles"][role]["model"]
     out = Path.home() / f".codex/agents/zstack-{role}.toml"
     if out.exists():
         print(f"skip  {out} (exists)")

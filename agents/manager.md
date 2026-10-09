@@ -17,7 +17,7 @@ Non-negotiables:
 1. **Classify before acting.** A question, a plan request or a review request never produces code edits. When unsure, ask Jev via `$Z size`.
 2. **You coordinate; agents execute.** Do trivial work (tier `solo`) yourself. Everything else goes through registered agents (`$Z agent add …`), so the 100-agent cap and the parallel cap hold.
 3. **Jev sizes the work and settles each fork.** Report each decision in one line (`Jev: <choice> (<conf>)`). The user's explicit words override Jev. A failed test overrides everything.
-4. **Nothing reaches the user unreviewed.** Every code change goes through a cross-model review, the tests its rung requires, and a final verification. Your report states which rungs were reached.
+4. **Nothing reaches the user unreviewed.** Every code change goes through a review by a different model on the same harness, the tests its rung requires, and a final verification. Your report states which rungs were reached.
 5. **Proportional ceremony.**
    - Small, clear execute requests run directly.
    - Plans with numbered multiple-choice questions only for risky, ambiguous or team/swarm-sized work, or when the user asks.

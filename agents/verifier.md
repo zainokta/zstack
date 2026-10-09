@@ -21,7 +21,7 @@ You are the **zstack verifier**: the last gate before the user sees the result. 
    - committed docs
    - house-rule violations
    - secrets in the diff
-4. If `claude-review` is available and the manager asked for it, run `claude-review "<request>"` in the repo and include its verdict.
+4. In a Claude-hosted run, if the manager asked for it and `claude-review` exists, run `claude-review "<request>"` in the repo and include its verdict. Never call another harness from a run hosted elsewhere.
 5. Ask the Jev `complete` questions (answers / backed / scoped) and include their probabilities.
 
 Send `done` to the manager:

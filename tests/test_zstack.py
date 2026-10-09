@@ -183,7 +183,7 @@ class ZstackTest(unittest.TestCase):
         self.z("rule", "add", "never put code in cmd/", "--project", "--repo", str(self.repo))
         self.z("rule", "add", "no alpine images")
         self.z("task", "add", "--title", "build x", "--paths", "x/")
-        self.z("agent", "add", "--role", "worker", "--harness", "codex", "--task", "t1")
+        self.z("agent", "add", "--role", "worker", "--harness", "codex", "--task", "t1", "--allow-cross")
         brief = self.z("brief", "worker-1").stdout
         for needle in ("never put code in cmd/", "no alpine images", "Never commit docs", "## Role", "owned paths: x/"):
             self.assertIn(needle, brief)
@@ -192,7 +192,7 @@ class ZstackTest(unittest.TestCase):
 
     def test_harness_override_uses_that_harness_default_model(self):
         self.init()
-        a = json.loads(self.z("--json", "agent", "add", "--role", "verifier", "--harness", "codex").stdout)
+        a = json.loads(self.z("--json", "agent", "add", "--role", "verifier", "--harness", "codex", "--allow-cross").stdout)
         self.assertEqual(a["model"], "gpt-6-sol")
         b = json.loads(self.z("--json", "agent", "add", "--role", "verifier").stdout)
         self.assertEqual(b["model"], "opus")
@@ -226,21 +226,65 @@ class ZstackTest(unittest.TestCase):
         self.assertIn(rid, self.z("--run", rid, "status").stdout)
         self.assertIn("Start the zstack manager", self.z("--help").stdout + self.z("--host", "codex", "--help").stdout)
 
-    def test_run_host_selects_role_profile(self):
-        self.z("init", "--goal", "g", "--repo", str(self.repo), "--host", "omp")
+    def fake_harness(self, name, script):
+        bindir = self.home / "bin"
+        bindir.mkdir(exist_ok=True)
+        exe = bindir / name
+        exe.write_text("#!/bin/sh\n" + script)
+        exe.chmod(0o755)
+        if str(bindir) not in self.env["PATH"]:
+            self.env["PATH"] = f"{bindir}:{self.env['PATH']}"
+
+    def test_default_and_codex_hosts_never_cross_subscriptions(self):
+        self.init()
+        roles = {r: json.loads(self.z("--json", "agent", "add", "--role", r, "--planned").stdout) for r in
+                 ("scout", "worker", "reviewer", "verifier")}
+        self.assertEqual({a["harness"] for a in roles.values()}, {"claude"})
+        self.assertEqual((roles["worker"]["model"], roles["reviewer"]["model"]), ("sonnet", "opus"))
+        p = self.z("agent", "add", "--role", "reviewer", "--harness", "codex", ok=False)
+        self.assertIn("--allow-cross", p.stderr)
+        self.z("init", "--goal", "g", "--repo", str(self.repo), "--host", "codex")
         w = json.loads(self.z("--json", "agent", "add", "--role", "worker").stdout)
-        self.assertEqual((w["harness"], w["model"]), ("omp", "commandcode/deepseek/deepseek-v4.1-flash"))
         r = json.loads(self.z("--json", "agent", "add", "--role", "reviewer").stdout)
-        self.assertEqual(r["harness"], "codex")
-        self.env["ZSTACK_HOST"] = "codex"
-        self.z("init", "--goal", "g2", "--repo", str(self.repo))
-        w2 = json.loads(self.z("--json", "agent", "add", "--role", "worker").stdout)
-        self.assertEqual((w2["harness"], w2["model"]), ("codex", "gpt-6-luna"))
+        self.assertEqual((w["harness"], w["model"], r["harness"], r["model"]), ("codex", "gpt-6-luna", "codex", "gpt-6-sol"))
+
+    def test_setup_host_needs_one_time_model_choice(self):
+        self.fake_harness("omp", "printf 'commandcode (2)\\n│ model │ ctx │\\n│ deepseek/deepseek-v4.1-flash │ 1M │\\n│ z-ai/glm-5.3-flash │ 1M │\\n'\n")
+        self.z("init", "--goal", "g", "--repo", str(self.repo), "--host", "omp")
+        p = self.z("agent", "add", "--role", "worker", ok=False)
+        self.assertIn("zstack setup --host omp", p.stderr)
+        p = self.z("setup", "--host", "omp", "--work", "commandcode/deepseek/deepseek-v4.1-flash", ok=False)
+        self.assertIn("missing --fast", p.stderr)
+        self.z("setup", "--host", "omp", "--fast", "commandcode/z-ai/glm-5.3-flash",
+               "--work", "commandcode/deepseek/deepseek-v4.1-flash", "--strong", "commandcode/z-ai/glm-5.3-flash",
+               "--review", "commandcode/z-ai/glm-5.3-flash")
+        saved = (self.home / "zstack.toml").read_text()
+        self.assertIn("configured = true", saved)
+        w = json.loads(self.z("--json", "agent", "add", "--role", "worker").stdout)
+        r = json.loads(self.z("--json", "agent", "add", "--role", "reviewer").stdout)
+        self.assertEqual((w["harness"], w["model"]), ("omp", "commandcode/deepseek/deepseek-v4.1-flash"))
+        self.assertEqual((r["harness"], r["model"]), ("omp", "commandcode/z-ai/glm-5.3-flash"))
+
+    def test_setup_defaults_and_launch_gate(self):
+        self.fake_harness("pi", "echo 'provider model'; echo 'openai-codex gpt-6-luna'; echo 'openai-codex gpt-6-sol'\n")
+        p = self.z("--host", "pi", ok=False)
+        self.assertIn("zstack setup --host pi", p.stderr)
+        out = json.loads(self.z("--json", "setup", "--host", "pi", "--defaults").stdout)
+        self.assertEqual(out["tiers"]["review"], "openai-codex/gpt-6-sol")
+        self.z("init", "--goal", "g", "--repo", str(self.repo), "--host", "pi")
+        sc = json.loads(self.z("--json", "agent", "add", "--role", "scribe").stdout)
+        self.assertEqual((sc["harness"], sc["model"]), ("pi", "openai-codex/gpt-6-luna"))
+        # a later setup for another host keeps the pi choice
+        self.fake_harness("opencode", "echo opencode-go/deepseek-v4.1-flash; echo opencode-go/deepseek-v4-pro; echo opencode-go/gpt-5.6-luna\n")
+        self.z("setup", "--host", "opencode", "--defaults")
+        saved = (self.home / "zstack.toml").read_text()
+        self.assertIn("[hosts.pi.roles.scout]", saved)
+        self.assertIn("[hosts.opencode.roles.scout]", saved)
 
     def test_spawn_dry_run_uses_readonly_template_for_reviewers(self):
         self.init()
-        self.z("agent", "add", "--role", "reviewer", "--harness", "codex", "--model", "gpt-6-sol")
-        self.z("agent", "add", "--role", "worker", "--harness", "omp", "--model", "deepseek")
+        self.z("agent", "add", "--role", "reviewer", "--harness", "codex", "--model", "gpt-6-sol", "--allow-cross")
+        self.z("agent", "add", "--role", "worker", "--harness", "omp", "--model", "deepseek", "--allow-cross")
         rev = json.loads(self.z("--json", "spawn", "reviewer-1", "--dry-run").stdout)
         cwd = rev["argv"][rev["argv"].index("-C") + 1]
         self.assertTrue(cwd.endswith(json.loads(self.z("--json", "status").stdout)["run"]["id"]))
@@ -257,7 +301,7 @@ class ZstackTest(unittest.TestCase):
         fake.write_text("#!/bin/sh\necho 'changed x.go; go test ./... ok'\n")
         fake.chmod(0o755)
         self.env["PATH"] = f"{bindir}:{self.env['PATH']}"
-        self.z("agent", "add", "--role", "worker", "--harness", "pi", "--model", "m")
+        self.z("agent", "add", "--role", "worker", "--harness", "pi", "--model", "m", "--allow-cross")
         self.z("spawn", "worker-1")
         for _ in range(50):
             msgs = json.loads(self.z("--json", "msg", "inbox", "--peek").stdout)

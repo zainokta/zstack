@@ -6,10 +6,10 @@ max_parallel = 8        # agents running at once. Lower it when you hit rate lim
 reserve = 10            # slots kept free for repair, debugger and re-review agents
 max_review_rounds = 3   # review -> fix -> re-review rounds before the manager escalates
 
-# Role -> where the agent runs. `harness = "claude"` means an in-session Claude Code
-# subagent (manager uses the Agent tool with `agent`). Any other harness is a headless
-# process started by `zstack spawn`. Reviewers default to a different model family than
-# workers so that review is cross-model.
+# Role -> where the agent runs, for runs hosted in Claude Code (the default host).
+# Every role stays on Claude so a Claude-hosted run never uses another subscription.
+# Review stays cross-model: Sonnet workers are reviewed by Opus.
+# `harness = "claude"` means an in-session subagent (the manager uses the Agent tool with `agent`).
 [roles.scout]
 harness = "claude"
 agent = "zstack:scout"
@@ -26,9 +26,9 @@ agent = "zstack:worker"
 model = "sonnet"
 
 [roles.reviewer]
-harness = "codex"
+harness = "claude"
 agent = "zstack:reviewer"
-model = "gpt-6-sol"
+model = "opus"
 
 [roles.tester]
 harness = "claude"
@@ -95,51 +95,39 @@ argv = ["opencode", "run", "--model", "{model}", "--dir", "{repo}", "-f", "{brie
 readonly_argv = ["opencode", "run", "--model", "{model}", "--dir", "{repo}", "--agent", "plan", "-f", "{brief}", "--", "Follow the attached zstack brief exactly. Read-only: do not edit files."]
 stdin = false
 
-# Host profiles: role routing when the manager runs in another harness
-# (`zstack --host <host>`, recorded by `zstack init`). Unlisted roles fall back to
-# [roles.*] above. Each profile mirrors the setup you already run in that harness
-# (Codex luna/sol lanes, omp's Command Code roles, pi's openai-codex models), and
-# keeps reviewers and the verifier in a different model family from the workers.
+# Host profiles. A run hosted in a harness keeps every agent in that harness, so dropping
+# one subscription never breaks another host. Review stays cross-model within the host.
 [hosts.codex.roles]
 scout    = { harness = "codex", model = "gpt-6-luna" }
 planner  = { harness = "codex", model = "gpt-6-sol" }
 worker   = { harness = "codex", model = "gpt-6-luna" }
-reviewer = { harness = "claude", model = "sonnet" }
+reviewer = { harness = "codex", model = "gpt-6-sol" }
 tester   = { harness = "codex", model = "gpt-6-luna" }
 debugger = { harness = "codex", model = "gpt-6-sol" }
 operator = { harness = "codex", model = "gpt-6-luna" }
-verifier = { harness = "claude", model = "opus" }
+verifier = { harness = "codex", model = "gpt-6-sol" }
 scribe   = { harness = "codex", model = "gpt-6-luna" }
 
-[hosts.omp.roles]
-scout    = { harness = "omp", model = "commandcode/gpt-6-luna" }
-planner  = { harness = "omp", model = "commandcode/z-ai/glm-5.3-flash" }
-worker   = { harness = "omp", model = "commandcode/deepseek/deepseek-v4.1-flash" }
-reviewer = { harness = "codex", model = "gpt-6-sol" }
-tester   = { harness = "omp", model = "commandcode/deepseek/deepseek-v4.1-flash" }
-debugger = { harness = "omp", model = "openai-codex/gpt-6.1-sol" }
-operator = { harness = "omp", model = "commandcode/deepseek/deepseek-v4.1-flash" }
-verifier = { harness = "claude", model = "opus" }
-scribe   = { harness = "omp", model = "commandcode/gpt-6-luna" }
+# pi, omp and opencode route to many providers, so their models are chosen once with
+# `zstack setup --host <host>` (the first `zstack --host <host>` asks). The choice is saved
+# to ~/.local/state/zstack/zstack.toml. These are only the suggested answers, taken from
+# the setup each harness already has on this machine.
+# Tiers: fast = scout, scribe; work = worker, tester, operator; strong = planner, debugger;
+# review = reviewer, verifier.
+[setup.omp]
+fast   = "commandcode/gpt-6-luna"
+work   = "commandcode/deepseek/deepseek-v4.1-flash"
+strong = "commandcode/z-ai/glm-5.3-flash"
+review = "commandcode/z-ai/glm-5.3-flash"
 
-[hosts.pi.roles]
-scout    = { harness = "pi", model = "openai-codex/gpt-6-luna" }
-planner  = { harness = "pi", model = "openai-codex/gpt-6-sol" }
-worker   = { harness = "pi", model = "openai-codex/gpt-6-luna" }
-reviewer = { harness = "claude", model = "sonnet" }
-tester   = { harness = "pi", model = "openai-codex/gpt-6-luna" }
-debugger = { harness = "pi", model = "openai-codex/gpt-6-sol" }
-operator = { harness = "pi", model = "openai-codex/gpt-6-luna" }
-verifier = { harness = "claude", model = "opus" }
-scribe   = { harness = "pi", model = "openai-codex/gpt-6-luna" }
+[setup.pi]
+fast   = "openai-codex/gpt-6-luna"
+work   = "openai-codex/gpt-6-luna"
+strong = "openai-codex/gpt-6-sol"
+review = "openai-codex/gpt-6-sol"
 
-[hosts.opencode.roles]
-scout    = { harness = "opencode", model = "opencode-go/deepseek-v4.1-flash" }
-planner  = { harness = "codex", model = "gpt-6-sol" }
-worker   = { harness = "opencode", model = "opencode-go/deepseek-v4.1-flash" }
-reviewer = { harness = "codex", model = "gpt-6-sol" }
-tester   = { harness = "opencode", model = "opencode-go/deepseek-v4.1-flash" }
-debugger = { harness = "codex", model = "gpt-6-sol" }
-operator = { harness = "opencode", model = "opencode-go/deepseek-v4.1-flash" }
-verifier = { harness = "claude", model = "opus" }
-scribe   = { harness = "opencode", model = "opencode-go/deepseek-v4.1-flash" }
+[setup.opencode]
+fast   = "opencode-go/deepseek-v4.1-flash"
+work   = "opencode-go/deepseek-v4.1-flash"
+strong = "opencode-go/deepseek-v4-pro"
+review = "opencode-go/gpt-5.6-luna"

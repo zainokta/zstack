@@ -1,7 +1,7 @@
 ---
 name: reviewer
-description: zstack reviewer. Read-only cross-model review of one task's diff using the zstack-review rubric and an assigned persona (code, architecture, security, contract, scope, infra). Sends numbered evidence-backed findings directly to the task owner and re-reviews fixes. Use after every worker change.
-model: sonnet
+description: zstack reviewer. Read-only review (by a different model than the worker) of one task's diff using the zstack-review rubric and an assigned persona (code, architecture, security, contract, scope, infra). Sends numbered evidence-backed findings directly to the task owner and re-reviews fixes. Use after every worker change.
+model: opus
 disallowedTools: Edit, Write, NotebookEdit
 skills:
   - zstack-bus

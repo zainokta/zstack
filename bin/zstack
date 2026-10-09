@@ -36,19 +36,20 @@ class ZError(Exception):
 
 # ---------- config ----------
 
+def deep_merge(base, extra):
+    for k, v in extra.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
 def load_config():
     cfg = tomllib.loads((ROOT / "config/zstack.toml").read_text())
     override = HOME / "zstack.toml"
     if override.exists():
-        for k, v in tomllib.loads(override.read_text()).items():
-            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                for k2, v2 in v.items():
-                    if isinstance(v2, dict) and isinstance(cfg[k].get(k2), dict):
-                        cfg[k][k2].update(v2)
-                    else:
-                        cfg[k][k2] = v2
-            else:
-                cfg[k] = v
+        deep_merge(cfg, tomllib.loads(override.read_text()))
     lim = cfg["limits"]
     lim["max_agents"] = min(int(lim.get("max_agents", HARD_MAX_AGENTS)), HARD_MAX_AGENTS)
     return cfg
@@ -199,7 +200,13 @@ def role_cfg(cfg, role, host="claude"):
 def cmd_agent_add(args):
     cfg = load_config()
     run = resolve_run(args)
-    rc = role_cfg(cfg, args.role, run.meta.get("host", "claude"))
+    host = run.meta.get("host", "claude")
+    if not host_configured(cfg, host):
+        raise ZError(f"no models chosen for host {host}: run `zstack setup --host {host}` once")
+    rc = role_cfg(cfg, args.role, host)
+    if args.harness and args.harness != host and not args.allow_cross:
+        raise ZError(f"this run is hosted in {host}; agents stay on {host} so no other subscription is used. "
+                     f"Pass --allow-cross only if the user asked for {args.harness}.")
     with run.locked():
         agents = run.read("agents.json", {})
         meta = run.meta
@@ -430,7 +437,7 @@ def cmd_task_list(args):
 
 TIERS = {
     "solo": "Trivial or one obvious edit in one file; the manager does it inline, no agents",
-    "pair": "One focused change; one worker plus one cross-model reviewer",
+    "pair": "One focused change; one worker plus one reviewer on a different model",
     "squad": "A feature or fix touching a few files or 2-4 independent units; small team with review and tests",
     "team": "Multi-component work, 5-12 independent units or several repos; parallel workers, review pool, testers",
     "swarm": "Large fan-out: 13+ independent units (bulk audits, many services, many generators); big parallel pool",
@@ -634,6 +641,119 @@ def cmd_rule_forget(args):
         hits += len(lines) - len(keep)
         f.write_text("".join(keep))
     print(f"removed {hits} rule line(s) matching {args.pattern!r} (shipped rules/house.md is edited by hand)")
+
+
+# ---------- one-time model setup (pi, omp, opencode) ----------
+
+SETUP_HOSTS = ("pi", "omp", "opencode")
+MODEL_TIERS = {
+    "fast": ("scout", "scribe"),
+    "work": ("worker", "tester", "operator"),
+    "strong": ("planner", "debugger"),
+    "review": ("reviewer", "verifier"),
+}
+TIER_HELP = {
+    "fast": "scouts and scribe: lots of reading, cheap",
+    "work": "workers, testers, operators: most of the tokens",
+    "strong": "planner and debugger: hard reasoning",
+    "review": "reviewers and verifier: best as a different model than `work`",
+}
+
+
+def host_configured(cfg, host):
+    return host not in SETUP_HOSTS or bool(cfg.get("hosts", {}).get(host, {}).get("configured"))
+
+
+def list_models(host):
+    """Model ids the harness itself reports, as it accepts them in --model."""
+    argv = {"pi": ["pi", "--list-models"], "omp": ["omp", "models"], "opencode": ["opencode", "models"]}[host]
+    try:
+        text = subprocess.run(argv, capture_output=True, text=True, timeout=90).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    ids = []
+    if host == "pi":
+        for line in text.splitlines()[1:]:
+            cols = line.split()
+            if len(cols) >= 2:
+                ids.append(f"{cols[0]}/{cols[1]}")
+    elif host == "omp":
+        provider = None
+        for line in text.splitlines():
+            m = re.match(r"^(\S+) \(\d+\)$", line.strip())
+            if m:
+                provider = m.group(1)
+                continue
+            cell = re.match(r"^│\s*(\S+)\s*│", line)
+            if provider and cell and cell.group(1) != "model":
+                ids.append(f"{provider}/{cell.group(1)}")
+    else:
+        ids = [l.strip() for l in text.splitlines() if "/" in l and " " not in l.strip()]
+    return ids
+
+
+def base_model(model):
+    return model.split(":")[0]  # omp accepts `model:thinking`
+
+
+def ask_model(tier, suggested, models):
+    while True:
+        answer = input(f"  {tier:<6} ({TIER_HELP[tier]})\n         model [{suggested}] (? lists): ").strip()
+        if answer == "?":
+            print("\n".join(f"         {m}" for m in models) or "         (no list available)")
+            continue
+        choice = answer or suggested
+        if models and base_model(choice) not in models:
+            if input(f"         {choice} is not in the harness's list; use it anyway? [y/N] ").strip().lower() != "y":
+                continue
+        return choice
+
+
+def toml_dump(data, prefix=()):
+    lines, tables = [], []
+    for k, v in data.items():
+        if isinstance(v, dict):
+            tables.append((k, v))
+        else:
+            lines.append(f"{k} = {json.dumps(v)}")
+    out = ([f"[{'.'.join(prefix)}]"] if prefix and lines else []) + lines
+    for k, v in tables:
+        sub = toml_dump(v, prefix + (k,))
+        if sub:
+            out += ([""] if out else []) + [sub]
+    return "\n".join(out)
+
+
+def cmd_setup(args):
+    cfg = load_config()
+    host = args.host
+    suggested = cfg.get("setup", {}).get(host, {})
+    models = list_models(host)
+    picks = {t: getattr(args, t) for t in MODEL_TIERS}
+    interactive = sys.stdin.isatty() and not args.defaults
+    if interactive:
+        print(f"zstack setup for {host} (one time; saved to {HOME / 'zstack.toml'})")
+        print(f"{len(models)} models reported by {host}. Every agent in a {host}-hosted run uses {host} with these models.")
+    for tier in MODEL_TIERS:
+        if picks[tier]:
+            continue
+        if interactive:
+            picks[tier] = ask_model(tier, suggested.get(tier, ""), models)
+        elif args.defaults and suggested.get(tier):
+            picks[tier] = suggested[tier]
+        else:
+            raise ZError(f"missing --{tier} (or pass --defaults, or run in a terminal)")
+    unknown = [m for m in picks.values() if models and base_model(m) not in models]
+    if unknown and not interactive:
+        print(f"warning: not in {host}'s model list: {', '.join(unknown)}", file=sys.stderr)
+    path = HOME / "zstack.toml"
+    current = tomllib.loads(path.read_text()) if path.exists() else {}
+    roles = {role: {"harness": host, "model": picks[tier]} for tier, rs in MODEL_TIERS.items() for role in rs}
+    deep_merge(current, {"hosts": {host: {"configured": True, "roles": roles}}})
+    HOME.mkdir(parents=True, exist_ok=True)
+    path.write_text("# Machine settings written by `zstack setup`; edit freely.\n" + toml_dump(current) + "\n")
+    out(args, {"host": host, "tiers": picks, "path": str(path)},
+        "\n".join([f"saved {host} models to {path}:"] + [f"  {t:<6} {m}" for t, m in picks.items()]))
 
 
 # ---------- briefs and spawning ----------
@@ -911,6 +1031,10 @@ def launch(argv):
     args, extra = p.parse_known_args(argv)
     extra = [x for x in extra if x != "--"]
     repo = str(Path(args.repo or os.getcwd()).resolve())
+    if not host_configured(load_config(), args.host) and not args.dry_run:
+        if not sys.stdin.isatty():
+            raise ZError(f"first run on {args.host}: choose its models once with `zstack setup --host {args.host}`")
+        cmd_setup(argparse.Namespace(host=args.host, defaults=False, json=False, **{t: None for t in MODEL_TIERS}))
     prompt_file = HOME / "hosts" / f"{args.host}-manager.md"
     prompt_file.parent.mkdir(parents=True, exist_ok=True)
     prompt_file.write_text(manager_prompt(args.host))
@@ -970,6 +1094,7 @@ def build_parser():
     s.add_argument("--persona")
     s.add_argument("--task")
     s.add_argument("--planned", action="store_true", help="reserve a slot without counting it as active")
+    s.add_argument("--allow-cross", action="store_true", help="allow a harness other than the run's host (user asked for it)")
     s.set_defaults(fn=cmd_agent_add)
     s = ag.add_parser("set")
     s.add_argument("id")
@@ -1030,6 +1155,12 @@ def build_parser():
     s.add_argument("--file")
     s.add_argument("--no-jev", action="store_true")
     s.set_defaults(fn=cmd_size)
+    s = sub.add_parser("setup", help="one-time model choice for pi, omp or opencode hosts")
+    s.add_argument("--host", required=True, choices=SETUP_HOSTS)
+    for tier in MODEL_TIERS:
+        s.add_argument(f"--{tier}", help=f"model for {', '.join(MODEL_TIERS[tier])}")
+    s.add_argument("--defaults", action="store_true", help="take the suggested models without asking")
+    s.set_defaults(fn=cmd_setup)
     s = sub.add_parser("decide", help="log a Jev decision into the run")
     s.add_argument("--question", required=True)
     s.add_argument("--choice", required=True)

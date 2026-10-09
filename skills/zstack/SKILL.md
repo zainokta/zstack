@@ -70,10 +70,10 @@ Run waves until every task is `done` or blocked:
 
 1. **Tasks.** `$Z task add --title … --accept "<testable criteria>" --paths <owned paths> --deps …` for each unit. Writers on overlapping paths are serialized (the ledger enforces this) unless the policy is `per-writer` worktrees.
 2. **Spawn workers** for ready tasks, up to `max_parallel`, using the spawning steps in §5.
-3. **Review loop per task.** When a worker sends `review-request`, assign a reviewer, cross-model by default. The reviewer sends numbered `findings` **directly to the worker**. The worker fixes them and sends `fix-done`, and the reviewer re-checks. This repeats until `approved`, with at most `max_review_rounds`. If the same property fails twice, a debugger agent takes over from the reserve, then a stronger model, then you ask the user.
+3. **Review loop per task.** When a worker sends `review-request`, assign a reviewer (a different, usually stronger, model than the worker, on the same harness). The reviewer sends numbered `findings` **directly to the worker**. The worker fixes them and sends `fix-done`, and the reviewer re-checks. This repeats until `approved`, with at most `max_review_rounds`. If the same property fails twice, a debugger agent takes over from the reserve, then a stronger model, then you ask the user.
 4. **Test.** After `approved`, the tester runs the real checks: unit, e2e with real containers, a browser check for UI, and a benchmark or parity check when performance or contracts are involved. Failures go back to the worker as `test-result`.
 5. **Integrate.** When several workers touched one repo, run the full build and test suite yourself, or have a tester do it, on the combined tree.
-6. **Verify.** One verifier from a different model family than the workers checks the whole diff against the original request, scope rules and evidence. Use `claude-review "<request>"` when the repo is git and the diff is ready (exit 0 correct, 3 incorrect, 1 unavailable). Otherwise spawn `zstack:verifier`.
+6. **Verify.** One verifier, on a different model than the workers, checks the whole diff against the original request, scope rules and evidence. In a Claude-hosted run you may use `claude-review "<request>"` (exit 0 correct, 3 incorrect, 1 unavailable); otherwise spawn the verifier role.
 7. **Docs.** Only if asked, or if the change alters a contract: the scribe writes FE/mobile handover notes, an ADR status update and a README sync. These are **not committed** unless the git policy says so.
 8. **Git.** Only what the policy or user allows (see [zstack-git](../zstack-git/SKILL.md)).
 
@@ -96,14 +96,12 @@ id=$($Z agent add --role worker --task t3 [--harness codex] [--model gpt-6-luna]
   2. Call the Agent tool with `subagent_type: "zstack:<role>"` (e.g. `zstack:worker`), `run_in_background: true`, and the brief as the prompt.
   3. Record the agent's returned ID with `$Z agent set $id --session <agentId>`.
   4. To resume it for fix rounds, use SendMessage to that ID with "check your inbox". This keeps the original executor's context.
-- **Headless agent on another harness** (codex/omp/pi/opencode, or claude -p): run `$Z spawn $id`. It runs in the background and posts a `done` or `blocker` message to you when it exits. For a fix round, run `$Z spawn $id` again. The brief is re-rendered with the new findings.
-- **Routed Claude subagents** (`ocx-gpt-6-sol`, `ocx-gpt-6-luna`, `ocx-deepseek-deepseek-v4-1-flash`) are another way to get a different model in-session. Pass them `$Z brief $id --role` so they receive the role prompt.
+- **Headless agent** (any non-Claude host, or claude -p): run `$Z spawn $id`. It runs in the background and posts a `done` or `blocker` message to you when it exits. For a fix round, run `$Z spawn $id` again. The brief is re-rendered with the new findings.
 
-The default routing is in `config/zstack.toml`:
-- scouts: cheap model
-- workers: mid-tier model
-- reviewers: a **different family** from the workers (codex/gpt-6-sol)
-- verifier: strong model
+Routing is in `config/zstack.toml`, per host:
+- **Every agent stays on the run's host harness.** A Claude-hosted run uses only Claude models (Haiku scouts, Sonnet workers, Opus reviewers and verifier), a Codex-hosted run only Codex models (luna workers, sol reviewers). pi/omp/opencode use the models chosen once with `zstack setup`. This keeps each subscription independent: the user may drop one.
+- Review stays cross-model inside the host (worker model ≠ reviewer model).
+- `agent add --harness <other>` is refused unless you pass `--allow-cross`, and you pass it only when the user explicitly asked for that harness in this run. Routed proxy agents (`ocx-*`) count as another harness: don't use them unless asked.
 
 Rules:
 - An explicit user pin ("use luna", "not sol", "opus subagents") overrides config for this run.

@@ -1,6 +1,6 @@
 ---
 name: worker
-description: zstack implementer. Owns one task with bounded paths, implements the smallest correct change, runs its checks, requests cross-model review, fixes findings sent back to it, and reports with evidence. Use for any code, config or test change in a zstack run.
+description: zstack implementer. Owns one task with bounded paths, implements the smallest correct change, runs its checks, requests review from a different model, fixes findings sent back to it, and reports with evidence. Use for any code, config or test change in a zstack run.
 model: sonnet
 skills:
   - zstack-bus

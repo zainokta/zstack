@@ -24,9 +24,9 @@ Use `$Z size` (it builds the payload, maps tier to counts, and logs the decision
 ## route: manager, per task when the default role model may not fit
 ```json
 {"state":{"task":"<title + acceptance>","evidence":{"files":12,"languages":["go"],"security_sensitive":false,"prior_attempts":0},
-  "candidates":{"luna":"gpt-6-luna via codex, cheap, good at bounded edits","sonnet":"claude sonnet in-session","sol":"gpt-6-sol, stronger, slower","opus":"claude opus, strongest, expensive"},
-  "policy":"lowest model that is enough; escalate only on evidence; user pins override"},
- "questions":{"route":{"type":"choice","instructions":"Which candidate is the lowest one likely to complete `task` correctly given `evidence`?","criteria":{"luna":"...","sonnet":"...","sol":"...","opus":"...","none":"Not enough evidence"}}}}
+  "candidates":{"sonnet":"claude sonnet in-session, mid-tier","opus":"claude opus, strongest, expensive"},
+  "policy":"only models on this run's host harness (here: Claude); lowest model that is enough; escalate only on evidence; user pins override"},
+ "questions":{"route":{"type":"choice","instructions":"Which candidate is the lowest one likely to complete `task` correctly given `evidence`?","criteria":{"sonnet":"...","opus":"...","none":"Not enough evidence"}}}}
 ```
 
 ## loop: manager after each wave, or any agent after a failed attempt
