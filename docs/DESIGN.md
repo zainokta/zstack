@@ -84,11 +84,13 @@ Resuming the original executor for fix rounds:
 | scout | claude / haiku | cheap fan-out reads |
 | planner | claude / opus | plan quality matters most |
 | worker | claude / sonnet | mid-tier implementer |
-| reviewer | **codex / gpt-6-sol** | different family from the workers = real cross-model review |
+| reviewer | claude / opus | a different model from the Sonnet workers, same subscription |
 | tester | claude / sonnet | needs tools, MCPs, Playwright |
 | debugger | claude / opus | hard diagnosis |
 | operator | claude / sonnet | long tool loops |
 | verifier | claude / opus (or `claude-review`) | final independent gate |
+
+That table is the Claude host. Each host keeps all agents on its own harness (decided 2026-10-09 so a lapsed subscription only affects its own host): Codex uses luna/sol, and pi/omp/opencode use the models picked once with `zstack setup --host <host>`, saved to `~/.local/state/zstack/zstack.toml`.
 | scribe | claude / haiku | docs |
 
 Override per machine in `~/.local/state/zstack/zstack.toml`, or per agent with `agent add --harness/--model`. User pins win. Models are never silently substituted.

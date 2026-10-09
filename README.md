@@ -27,13 +27,25 @@ Headless: `claude -p --plugin-dir ~/Project/zstack --agent zstack:manager --perm
 
 | host | how the manager is loaded | default team (config `[hosts.<host>.roles]`) |
 |---|---|---|
-| claude | plugin agent `zstack:manager` | workers Sonnet in-session, reviewers Codex gpt-6-sol, verifier Opus |
-| codex | manager prompt as `developer_instructions`, workspace-write sandbox + network | workers/scouts gpt-6-luna, planner/debugger gpt-6-sol, reviewers Claude Sonnet, verifier Opus |
-| omp | `--append-system-prompt` | workers DeepSeek v4.1 flash (Command Code), scouts luna, planner GLM 5.3 flash, reviewers Codex sol, verifier Opus |
-| pi | `--append-system-prompt` | workers luna, planner/debugger sol (openai-codex), reviewers Claude Sonnet, verifier Opus |
-| opencode | inline `zstack-manager` agent via `OPENCODE_CONFIG_CONTENT` | workers DeepSeek v4.1 flash (opencode-go), planner/reviewer/debugger Codex sol, verifier Opus |
+| claude | plugin agent `zstack:manager` | Claude only: scouts Haiku, workers Sonnet, reviewers and verifier Opus |
+| codex | manager prompt as `developer_instructions`, workspace-write sandbox + network | Codex only: scouts/workers gpt-6-luna, planner/debugger/reviewers/verifier gpt-6-sol |
+| omp | `--append-system-prompt` | omp only, models chosen once in `zstack setup --host omp` (suggested: DeepSeek v4.1 flash workers, GLM 5.3 flash planner/reviewers, luna scouts, all via Command Code) |
+| pi | `--append-system-prompt` | pi only, chosen in `zstack setup --host pi` (suggested: luna workers, sol planner/reviewers via openai-codex) |
+| opencode | inline `zstack-manager` agent via `OPENCODE_CONFIG_CONTENT` | opencode only, chosen in `zstack setup --host opencode` (suggested: DeepSeek v4.1 flash workers, v4 pro planner, gpt-5.6-luna reviewers via opencode-go) |
 
-Outside Claude Code the manager spawns every agent through `zstack spawn` (there is no Agent tool). Codex runs each shell command in a sandbox that kills its child processes, so for `--host codex` the launcher also starts a small dispatcher outside the sandbox: `zstack spawn` queues the agent and the dispatcher starts it. Reviewers always come from a different model family than the workers.
+Outside Claude Code the manager spawns every agent through `zstack spawn` (there is no Agent tool). Codex runs each shell command in a sandbox that kills its child processes, so for `--host codex` the launcher also starts a small dispatcher outside the sandbox: `zstack spawn` queues the agent and the dispatcher starts it. **Agents never leave the host harness**, so dropping one subscription never breaks another host; review stays cross-model inside it (Sonnet → Opus, luna → sol). `zstack agent add --harness <other>` is refused without `--allow-cross`.
+
+### One-time setup for pi, omp, opencode
+
+These harnesses route to many providers, so zstack asks once which model each tier uses: **fast** (scouts, scribe), **work** (workers, testers, operators), **strong** (planner, debugger) and **review** (reviewers, verifier). The first `zstack --host <host>` asks; you can also run it directly:
+
+```bash
+zstack setup --host omp                    # interactive; `?` lists the harness's models, Enter takes the suggestion
+zstack setup --host pi --defaults          # take the suggestions
+zstack setup --host opencode --work opencode-go/deepseek-v4.1-flash --review opencode-go/gpt-5.6-luna --fast … --strong …
+```
+
+The choice is saved in `~/.local/state/zstack/zstack.toml` and checked against the harness's own model list.
 
 ## How it flows
 
@@ -70,12 +82,12 @@ flowchart TD
     W1 -->|review-request| RV
     W2 -->|review-request| RV
     W3 -->|review-request| RV
-    RV["Reviewers<br/>Codex gpt-6-sol, read-only"] -->|"findings → same worker"| FIX[Owner fixes]
+    RV["Reviewers<br/>different model, same harness, read-only"] -->|"findings → same worker"| FIX[Owner fixes]
     FIX -->|fix-done| RV
     FIX -->|"same property fails twice"| DBG["Debugger → stronger model → you"]
     RV -->|approved| TS["Testers<br/>unit → e2e → run → browser → parity"]
     TS -->|"test-result: fail"| FIX
-    TS -->|all tasks done with evidence| VF["Verifier<br/>re-runs checks · scope · claude-review<br/>Jev: answers / backed / scoped"]
+    TS -->|all tasks done with evidence| VF["Verifier<br/>re-runs checks · scope<br/>Jev: answers / backed / scoped"]
     VF -->|FAIL| FIX
     VF -->|PASS| DOC["Scribe (only if docs needed)"]
     DOC --> GIT["Git: only what you allowed"]
@@ -88,7 +100,7 @@ flowchart TD
 sequenceDiagram
     participant M as Manager
     participant W as worker-1
-    participant R as reviewer-1 (Codex)
+    participant R as reviewer-1 (Opus)
     participant T as tester-1
     M->>W: task t1 (brief: paths, acceptance, house rules)
     W->>W: implement + checks
@@ -128,7 +140,7 @@ Jev picks the size. To force one, say "use a team", "use 8 agents" or "no subage
 | `skills/zstack-debug` | root-cause loop used after two failed fixes |
 | `skills/zstack-git` | git policy (default: no commit, current branch, no worktree) |
 | `rules/house.md` | your standing rules, injected into every agent brief |
-| `config/zstack.toml` | caps and role → harness/model routing (reviewers default to Codex for cross-model review) |
+| `config/zstack.toml` | caps, per-host role → model routing, setup suggestions |
 | `bin/zstack` | stdlib-only Python CLI: run ledger, task graph, message bus, caps, Jev sizing, briefs, cross-harness spawn |
 | `tests/` | `python3 -m unittest discover tests` |
 | `mods/` | Claude Code mods (below); `.claude-plugin/marketplace.json` lists zstack and every mod |
@@ -163,8 +175,8 @@ Claude Code mods (plugins of function hooks) aimed at the frustrations that come
 | mod | what it does | the pain it targets |
 |---|---|---|
 | `intent-gate` | Jev classifies each prompt as question / plan / review / execute / ops; on non-execute turns it refuses Edit/Write and git writes with a reason. `/intent execute` or `/intent off` overrides. Fails open when Jev is down. | "why you implement? I only want the docs" |
-| `git-guard` | Blocks staging docs/plans, `git add -A`, force push, rebase and amend unless your prompt asked; strips co-author lines. *(landing next)* | committed docs, co-author lines, surprise rebases |
-| `stack-blast-radius` | Holds `terraform apply`, `pulumi up`, cloud deletes/deploys and broad SQL writes for a Proceed/Cancel pane with a dry-run preview. *(landing next)* | over-broad deletes, risky infra |
+| `git-guard` | Blocks staging docs/plans, `git add -A`, force push, rebase and amend unless your prompt asked; strips co-author lines. | committed docs, co-author lines, surprise rebases |
+| `stack-blast-radius` | Holds `terraform apply`, `pulumi up`, cloud deletes/deploys and broad SQL writes for a Proceed/Cancel pane with a dry-run preview. | over-broad deletes, risky infra |
 | `secret-vault` | Swaps pasted JWTs, cookies, DSNs, passwords and keys for `⟨secret:N⟩` placeholders before the model sees them, puts real values back only inside commands, masks them in output. `/vault list`. | live secrets in transcripts |
 | `loop-breaker` | After the same failure twice (or the same error pasted again) tells the model to stop patching and diagnose. | "still same ahh" loops |
 | `evidence-check` | Flags a reply that claims "tests pass / fixed / verified" when no test or check ran that turn. | "you said it pass?" |
