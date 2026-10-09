@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "zstack manager-led agent team plus Claude Code mods built from the user's own usage.",
-    "version": "0.2.0"
+    "version": "0.3.0"
   },
   "plugins": [
     {
@@ -17,6 +17,11 @@
       "name": "evidence-check",
       "description": "Flags replies that claim tests pass, fixed or verified when no test, build, lint, curl or DB check ran that turn.",
       "source": "./mods/evidence-check"
+    },
+    {
+      "name": "git-guard",
+      "description": "Refuses git pushes, force pushes, rebases, amends, hard resets, `git add -A` and doc commits the person didn't ask for this turn, and strips Claude's co-author trailer.",
+      "source": "./mods/git-guard"
     },
     {
       "name": "intent-gate",
@@ -42,6 +47,11 @@
       "name": "ship-state",
       "description": "One line above the prompt: branch, ahead/behind upstream, dirty counts and the last test result, so 'is it pushed?' answers itself.",
       "source": "./mods/ship-state"
+    },
+    {
+      "name": "stack-blast-radius",
+      "description": "Holds terraform/pulumi apply and destroy, gcloud/aws deletes, kubectl delete/apply, docker system prune, rm -rf outside build dirs, and destructive SQL behind a Proceed/Cancel pane with a dry-run preview.",
+      "source": "./mods/stack-blast-radius"
     },
     {
       "name": "tool-fold",

@@ -1,0 +1,7 @@
+{
+  "name": "git-guard",
+  "version": "0.1.0",
+  "description": "Refuses git pushes, force pushes, rebases, amends, hard resets, `git add -A` and doc commits the person didn't ask for this turn, and strips Claude's co-author trailer.",
+  "author": { "name": "zainokta" },
+  "types": "./types/index.d.ts"
+}

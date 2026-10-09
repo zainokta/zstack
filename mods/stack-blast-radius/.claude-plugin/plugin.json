@@ -1,0 +1,7 @@
+{
+  "name": "stack-blast-radius",
+  "version": "0.1.0",
+  "description": "Holds terraform/pulumi apply and destroy, gcloud/aws deletes, kubectl delete/apply, docker system prune, rm -rf outside build dirs, and destructive SQL behind a Proceed/Cancel pane with a dry-run preview.",
+  "author": { "name": "zainokta" },
+  "types": "./types/index.d.ts"
+}
