@@ -1,0 +1,6 @@
+{
+  "name": "zstack",
+  "version": "0.1.0",
+  "description": "Manager-led agent team: one manager sizes work with Jev and coordinates up to 100 scouts, planners, workers, reviewers, testers, debuggers, operators, verifiers and scribes over a shared message bus.",
+  "author": { "name": "zainokta" }
+}
